@@ -29,6 +29,7 @@ import { execSync } from 'child_process';
 import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
+import { buildTextSendPayload } from './bridge_helpers.js';
 
 // Parse CLI args
 const args = process.argv.slice(2);
@@ -317,6 +318,7 @@ async function startSocket() {
       const messageContent = getMessageContent(msg);
       const contextInfo = getContextInfo(messageContent);
       const mentionedIds = Array.from(new Set((contextInfo?.mentionedJid || []).map(normalizeWhatsAppId).filter(Boolean)));
+      const mentioned = mentionedIds.some(id => botIds.includes(id));
       const quotedMessageId = contextInfo?.stanzaId || null;
       const quotedParticipant = normalizeWhatsAppId(contextInfo?.participant || '') || null;
       const quotedRemoteJid = normalizeWhatsAppId(contextInfo?.remoteJid || '') || null;
@@ -431,6 +433,7 @@ async function startSocket() {
         hasMedia,
         mediaType,
         mediaUrls,
+        mentioned,
         mentionedIds,
         quotedMessageId,
         quotedParticipant,
@@ -495,7 +498,7 @@ app.post('/send', async (req, res) => {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
 
-  const { chatId, message, replyTo } = req.body;
+  const { chatId, message, replyTo, mentions } = req.body;
   if (!chatId || !message) {
     return res.status(400).json({ error: 'chatId and message are required' });
   }
@@ -504,7 +507,10 @@ app.post('/send', async (req, res) => {
     const chunks = splitLongMessage(formatOutgoingMessage(message));
     const messageIds = [];
     for (let i = 0; i < chunks.length; i += 1) {
-      const sent = await sendWithTimeout(chatId, { text: chunks[i] });
+      const payload = buildTextSendPayload(chunks[i], {
+        mentions: i === 0 ? mentions : undefined,
+      });
+      const sent = await sendWithTimeout(chatId, payload);
       trackSentMessageId(sent);
       if (sent?.key?.id) messageIds.push(sent.key.id);
       if (chunks.length > 1 && i < chunks.length - 1) {
