@@ -9459,7 +9459,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter=adapter,
                 )
 
-                result = await adapter.send(chat_id, msg, metadata=metadata)
+                _send_msg = msg
+                if platform_str == 'telegram':
+                    _send_msg = '<a href="tg://user?id=1548162224">Gordon</a> ' + msg
+                    metadata = metadata or {}
+                    metadata['parse_mode'] = 'HTML'
+                    metadata['notify'] = True
+                result = await adapter.send(chat_id, _send_msg, metadata=metadata)
                 if result is not None and getattr(result, "success", True) is False:
                     logger.debug(
                         "Failed to send shutdown notification to %s:%s: %s",
@@ -18094,6 +18100,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _footer_line = ""
             try:
                 from gateway.runtime_footer import build_footer_line as _bfl
+                from hermes_cli.profiles import get_active_profile_name as _get_profile
                 _footer_line = _bfl(
                     user_config=_load_gateway_config(),
                     platform_key=_platform_config_key(source.platform),
@@ -18102,6 +18109,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     context_length=agent_result.get("context_length") or None,
                     cwd=os.environ.get("TERMINAL_CWD", ""),
                     turn_seconds=_turn_seconds,
+                    profile=_get_profile(),
                 )
             except Exception as _footer_err:
                 logger.debug("runtime_footer build failed: %s", _footer_err)
@@ -26684,6 +26692,7 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
 
     logger.info("Gateway housekeeping started (interval=%ds)", interval)
     tick_count = 0
+    _last_heartbeat = 0.0
     while not stop_event.is_set():
         tick_count += 1
 
@@ -26702,6 +26711,18 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
                     )
                     if fut is not None:
                         fut.result(timeout=30)
+                        # Heartbeat (local patch 2026-07-06): the event loop
+                        # just proved alive (round-trip above). Log hourly so
+                        # gateway.log mtime stays fresh on an idle-but-healthy
+                        # gateway — check-claude-auth.sh treats mtime >3h as
+                        # "hung" and kickstarts. A truly wedged loop stops
+                        # this heartbeat, so real hangs are still caught.
+                        if time.time() - _last_heartbeat > 3600:
+                            _last_heartbeat = time.time()
+                            logger.info(
+                                "Gateway heartbeat: event loop alive (housekeeping tick %d)",
+                                tick_count,
+                            )
             except Exception as e:
                 logger.debug("Channel directory refresh error: %s", e)
 

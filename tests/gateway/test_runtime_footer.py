@@ -317,3 +317,79 @@ def test_default_build_footer_line_ignores_turn_seconds(monkeypatch):
     with_timing = build_footer_line(**common, turn_seconds=125.0)
     assert baseline == "gpt-5.4 · 5% · /var/data"
     assert with_timing == baseline
+
+
+# ---------------------------------------------------------------------------
+# profile field
+# ---------------------------------------------------------------------------
+
+def test_format_footer_includes_profile():
+    out = format_runtime_footer(
+        model="glm-5.1",
+        context_tokens=500, context_length=1000,
+        cwd="/tmp",
+        profile="daily",
+        fields=("profile", "model", "context_pct"),
+    )
+    assert out == "daily · glm-5.1 · 50%"
+
+
+def test_format_footer_profile_first():
+    """Profile at the start for multi-bot identification at a glance."""
+    out = format_runtime_footer(
+        model="glm-5.1",
+        context_tokens=500, context_length=1000,
+        cwd="/tmp",
+        profile="dev",
+        fields=("profile", "model"),
+    )
+    assert out == "dev · glm-5.1"
+
+
+def test_format_footer_drops_empty_profile():
+    out = format_runtime_footer(
+        model="glm-5.1",
+        context_tokens=500, context_length=1000,
+        cwd="/tmp",
+        profile="",
+        fields=("profile", "model"),
+    )
+    # profile silently dropped
+    assert out == "glm-5.1"
+
+
+def test_format_footer_drops_none_profile():
+    out = format_runtime_footer(
+        model="glm-5.1",
+        context_tokens=500, context_length=1000,
+        cwd="/tmp",
+        profile=None,
+        fields=("profile", "model"),
+    )
+    assert out == "glm-5.1"
+
+
+def test_build_footer_with_profile():
+    out = build_footer_line(
+        user_config={"display": {"runtime_footer": {"enabled": True, "fields": ["profile", "model"]}}},
+        platform_key="feishu",
+        model="openai/gpt-5.4",
+        context_tokens=10, context_length=100,
+        cwd="/tmp",
+        profile="knowledge",
+    )
+    assert out == "knowledge · gpt-5.4"
+
+
+def test_build_footer_profile_backward_compat():
+    """Existing configs without profile field still work; profile is just not shown."""
+    out = build_footer_line(
+        user_config={"display": {"runtime_footer": {"enabled": True, "fields": ["model", "context_pct"]}}},
+        platform_key="telegram",
+        model="openai/gpt-5.4",
+        context_tokens=25, context_length=100,
+        cwd="/tmp",
+        profile="main",
+    )
+    assert "main" not in out
+    assert "gpt-5.4" in out
