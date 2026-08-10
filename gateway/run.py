@@ -18100,7 +18100,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _footer_line = ""
             try:
                 from gateway.runtime_footer import build_footer_line as _bfl
-                from hermes_cli.profiles import get_active_profile_name as _get_profile
                 _footer_line = _bfl(
                     user_config=_load_gateway_config(),
                     platform_key=_platform_config_key(source.platform),
@@ -18109,7 +18108,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     context_length=agent_result.get("context_length") or None,
                     cwd=os.environ.get("TERMINAL_CWD", ""),
                     turn_seconds=_turn_seconds,
-                    profile=_get_profile(),
+                    profile=self._footer_profile_for_source(source),
                 )
             except Exception as _footer_err:
                 logger.debug("runtime_footer build failed: %s", _footer_err)
@@ -24679,6 +24678,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
             )
+
+    def _footer_profile_for_source(self, source: SessionSource) -> Optional[str]:
+        """Profile name to display in the runtime footer for this source.
+
+        Under multiplexing the routed profile is authoritative:
+        ``source.profile`` is stamped at routing time (``profile_routes``
+        matching in ``build_source``, the ``/p/<profile>/`` URL prefix, or
+        per-credential adapter ownership). Inside a routed profile's own
+        HERMES_HOME the "active profile" is always ``default``, so
+        ``get_active_profile_name()`` would mislabel multiplexed footers.
+
+        Resolution order mirrors ``_resolve_profile_home_for_source``:
+          1. ``source.profile`` (stamped at routing time)
+          2. ``_profile_name_for_source`` (defensive re-match for sources
+             that bypassed ``build_source``)
+          3. the active profile name — preserves single-profile gateway
+             footer output exactly.
+        """
+        try:
+            name = (getattr(source, "profile", None) or "").strip()
+            if name:
+                return name
+        except Exception:
+            pass
+        try:
+            name = self._profile_name_for_source(source)
+            if name:
+                return name
+        except Exception:
+            pass
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+            return get_active_profile_name()
+        except Exception:
+            return None
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
         """Resolve the profile name for an inbound source via configured routes.
