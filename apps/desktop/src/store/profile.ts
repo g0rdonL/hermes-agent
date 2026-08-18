@@ -25,6 +25,13 @@ export function normalizeProfileKey(name: string | null | undefined): string {
   return value || 'default'
 }
 
+// Presentation-only label: the display_name from profile.yaml when set (e.g. a
+// renamed default profile), else the canonical name. Never used for
+// comparison or routing — canonical `name` remains the identity everywhere.
+export function profileLabel(profile: Pick<ProfileInfo, 'display_name' | 'name'>): string {
+  return (profile.display_name ?? '').trim() || profile.name
+}
+
 // The profile the running local backend is actually scoped to (mirrors
 // /api/profiles/active `current`). "default" is the root ~/.hermes. This is the
 // display source of truth for the statusbar pill; the desktop's *stored*
@@ -174,7 +181,11 @@ export async function switchProfile(name: string): Promise<void> {
 // A single-profile user never triggers a swap, so their path is unchanged.
 
 // The profile the live gateway WebSocket is currently connected to. Initialized
-// to the primary (window) backend's profile on boot.
+// to the primary (window) backend's profile on boot. The gateway registry
+// mirrors its own route into this atom via the onActiveRouteChanged callback
+// (wired in use-gateway-boot's configureGatewayRegistry), so registry-internal
+// eviction fallbacks (idle reap, connection removal, profile delete) can never
+// leave this naming a profile the active socket no longer serves (#89206).
 export const $activeGatewayProfile = atom<string>('default')
 
 // Profile for the NEXT new chat (chosen via the new-chat picker). null = primary
