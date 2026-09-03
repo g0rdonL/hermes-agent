@@ -5,6 +5,8 @@ import importlib
 import logging
 import os
 import sys
+import time
+from pathlib import Path
 
 import pytest
 
@@ -68,7 +70,12 @@ class TestGuidanceConstants:
         assert "declarative facts" in MEMORY_GUIDANCE
         assert "imperative phrasing" in MEMORY_GUIDANCE
         assert "stale within a week" in MEMORY_GUIDANCE
-        assert "Save proactively" in MEMORY_GUIDANCE  # positive posture leads
+        # Skills are the default home for task-learned knowledge (incl. the
+        # user's preferences/corrections for that work); memory is the narrow
+        # every-session exception. The routing rule must LEAD, not trail.
+        assert MEMORY_GUIDANCE.index("Skills come first") < MEMORY_GUIDANCE.index("Memory is the narrow exception")
+        assert "preferences and corrections" in MEMORY_GUIDANCE
+        assert "Save proactively" not in MEMORY_GUIDANCE
         assert "workflows belong" in MEMORY_GUIDANCE
         # The category/SKIP curricula must NOT be re-taught here.
         assert "PR numbers" not in MEMORY_GUIDANCE
@@ -1106,6 +1113,13 @@ class TestExecutionGuidanceModels:
         for fam in ("deepseek", "kimi", "qwen", "glm", "minimax", "mimo", "mistral"):
             assert fam in EXECUTION_GUIDANCE_MODELS
 
+    def test_muse_spark_gets_both_guidance_blocks(self):
+        # Muse Spark closes the turn after a chat-only response on defaults
+        # (#96550) — it needs tool-use enforcement AND execution guidance.
+        from agent.prompt_builder import EXECUTION_GUIDANCE_MODELS
+        assert any(p in "meta/muse-spark-1.3-contributor" for p in TOOL_USE_ENFORCEMENT_MODELS)
+        assert any(p in "meta/muse-spark-1.3-contributor" for p in EXECUTION_GUIDANCE_MODELS)
+
     def test_excludes_google_and_claude(self):
         # Gemini/Gemma get GOOGLE_MODEL_OPERATIONAL_GUIDANCE instead;
         # Claude doesn't exhibit the targeted failure modes.
@@ -1140,3 +1154,40 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 
 
+
+
+class TestContextFileReadTimeout:
+    def test_slow_hermes_md_is_skipped_and_agents_md_still_loads(self, tmp_path, monkeypatch, caplog):
+        (tmp_path / ".git").mkdir()
+        (tmp_path / ".hermes.md").write_text("Hermes project rules.")
+        (tmp_path / "AGENTS.md").write_text("Agent fallback rules.")
+        # Patch the module object build_context_files_prompt actually closes
+        # over: an earlier test re-imports agent.prompt_builder, so the
+        # sys.modules entry can be a different module object.
+        pb_mod = sys.modules[build_context_files_prompt.__module__]
+        monkeypatch.setattr(pb_mod, "_get_context_file_read_timeout", lambda: 0.05)
+
+        original_read_text = Path.read_text
+
+        def slow_read_text(self, *args, **kwargs):
+            if self.name == ".hermes.md":
+                time.sleep(0.6)
+            return original_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", slow_read_text)
+
+        start = time.monotonic()
+        with caplog.at_level(logging.WARNING, logger=pb_mod.__name__):
+            result = build_context_files_prompt(cwd=str(tmp_path))
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 0.4, f"context load blocked for {elapsed:.2f}s"
+        assert "Agent fallback rules" in result
+        assert "Hermes project rules" not in result
+        assert "timed out" in caplog.text.lower()
+
+    def test_read_errors_still_propagate_to_caller(self, tmp_path):
+        from agent.prompt_builder import _read_text_with_timeout
+
+        with pytest.raises(FileNotFoundError):
+            _read_text_with_timeout(tmp_path / "missing.md", timeout=1.0)
