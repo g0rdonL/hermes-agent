@@ -4,6 +4,8 @@ appended to final gateway replies."""
 from __future__ import annotations
 
 
+import os
+
 import pytest
 
 from gateway.runtime_footer import (
@@ -15,6 +17,8 @@ from gateway.runtime_footer import (
     _humanize_tok,
     _split_provider_model,
 )
+
+_LEGACY_DEFAULT_FIELDS = ["model", "context_pct", "cwd"]
 
 
 # ---------------------------------------------------------------------------

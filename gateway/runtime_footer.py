@@ -13,8 +13,11 @@ delivered the text, it goes out as a trailing message via ``send_trailing_footer
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any, Iterable, Optional
+
+logger = logging.getLogger(__name__)
 
 _DEFAULT_FIELDS: tuple[str, ...] = ("model", "context_pct", "cwd")
 _SEP = " · "
@@ -201,6 +204,7 @@ def _reasoning_from_config(
             resolve_reasoning_config(user_config or {}, model or "")
         )
     except Exception:
+        logger.exception("reasoning config resolution failed")
         return ""
 
 
