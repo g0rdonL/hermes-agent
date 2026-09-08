@@ -1461,10 +1461,16 @@ class GatewayTurnMixin:
             from gateway.runtime_footer import build_footer_line as _bfl
             return _bfl(
                 user_config=_load_gateway_config(),
-                platform_key=_platform_config_key(source.platform), model=agent_result.get("model"),
+                platform_key=_platform_config_key(source.platform),
+                model=agent_result.get("model"),
+                provider=agent_result.get("provider"),
                 context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
                 context_length=agent_result.get("context_length") or None,
-                cwd=_terminal_scope_cwd(""), turn_seconds=_turn_seconds,
+                cwd=_terminal_scope_cwd(""),
+                turn_seconds=_turn_seconds,
+                reasoning_config=self._resolve_session_reasoning_config(
+                    source=source, model=agent_result.get("model") or ""
+                ),
             )
         except Exception as _footer_err:
             logger.debug("runtime_footer build failed: %s", _footer_err)
