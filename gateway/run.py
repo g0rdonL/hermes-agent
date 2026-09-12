@@ -2567,6 +2567,7 @@ def _dequeue_pending_event(adapter, session_key: str) -> MessageEvent | None:
 _INTERRUPT_REASON_STOP = "Stop requested"
 _INTERRUPT_REASON_RESET = "Session reset requested"
 _INTERRUPT_REASON_TIMEOUT = "Execution timed out (inactivity)"
+_INTERRUPT_REASON_EVICTED = "Session ended while the turn was running"
 _INTERRUPT_REASON_SSE_DISCONNECT = "SSE client disconnected"
 _INTERRUPT_REASON_GATEWAY_SHUTDOWN = "Gateway shutting down"
 _INTERRUPT_REASON_GATEWAY_RESTART = "Gateway restarting"
@@ -2700,7 +2701,8 @@ def _watch_gateway_turn_inactivity(
 _CONTROL_INTERRUPT_MESSAGES = frozenset({
     _INTERRUPT_REASON_STOP.lower(), _INTERRUPT_REASON_RESET.lower(),
     _INTERRUPT_REASON_TIMEOUT.lower(), _INTERRUPT_REASON_SSE_DISCONNECT.lower(),
-    _INTERRUPT_REASON_GATEWAY_SHUTDOWN.lower(), _INTERRUPT_REASON_GATEWAY_RESTART.lower()})
+    _INTERRUPT_REASON_EVICTED.lower(), _INTERRUPT_REASON_GATEWAY_SHUTDOWN.lower(),
+    _INTERRUPT_REASON_GATEWAY_RESTART.lower()})
 
 
 def _is_control_interrupt_message(message: Optional[str]) -> bool:
@@ -3516,11 +3518,8 @@ class GatewayRunner(
         # to one session_id (switch_session's many-to-one mapping), which routing-key guards cannot see.
         self._turn_leases = SessionTurnLeaseRegistry()
         # Stall-notified keys clear when pending clears / activity resumes / conversation boundary.
-        # Tokens for held turn leases, keyed by (routing key, run generation) so release is granted per-turn
-        # and a stale unwind can never free a newer turn's lease (#28686 ownership lesson). Held turn-lease
-        # tokens live on SessionState.turn.lease_token / .lease_generation (the old dict was keyed (routing
-        # key, generation) so a stale unwind could never free a newer turn's lease — the generation field
-        # preserves that ownership check, #28686). Runner-level queued interrupt text lives on
+        # Held turn-lease tokens live on SessionState.turn.lease_tokens keyed by run generation, so a
+        # stale unwind can never free a newer turn's lease (#28686). Runner-level queued interrupt text lives on
         # SessionState.persistent.pending_command_text (NOTE: distinct from the adapter-level
         # _pending_messages Dict[str, MessageEvent] in gateway/platforms/base.py, which shares the legacy
         # name). Last successfully-resolved (non-empty) model, keyed by session. Used as a fallback when a
