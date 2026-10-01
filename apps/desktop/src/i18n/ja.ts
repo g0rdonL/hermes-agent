@@ -2854,6 +2854,11 @@ export const ja = defineLocale({
     queueDroppedTitle: 'キューのエントリを破棄しました',
     queueDroppedBody:
       'このバックグラウンドのエントリは、セッションを繰り返し再開できなかったため破棄されました。キューの他のエントリには影響しません。',
+    terminalSelectionMissingTitle: 'ターミナル選択を利用できません',
+    terminalSelectionMissingBody:
+      '送信前にターミナル行を再選択（Ctrl/Cmd+L）してください — チップに元のテキストがありません。',
+    queuedTerminalSelectionExpiredBody:
+      'キュー内のターミナル選択はもう利用できません。行を再選択（Ctrl/Cmd+L）して、もう一度キューに入れてください。',
     previewUnavailable: 'プレビューは利用できません',
     previewLabel: label => `${label} のプレビュー`,
     couldNotPreview: label => `${label} をプレビューできませんでした`,
@@ -3577,6 +3582,8 @@ export const ja = defineLocale({
 
   preview: {
     tab: 'プレビュー',
+    pin: 'ワークスペースにピン留め',
+    unpin: 'ワークスペースからピン留めを外す',
     closePane: 'プレビューペインを閉じる',
     loading: 'プレビューを読み込み中',
     unavailable: 'プレビューは利用できません',
@@ -3946,6 +3953,8 @@ export const ja = defineLocale({
       skipped: 'スキップ済み',
       noAnswer: '回答なし',
       confirmAndContinueLabel: '確定して続行',
+      singleSelectHint: '1つ選ぶ',
+      multiSelectHint: '該当するものをすべて選択',
       questionProgress: (answered, total) => `${total}問中${answered}問回答済み`,
       notDelivered:
         'この質問はアプリに届かなかったため、ここでは回答できません。停止を押してターンを終了し、チャットで返信してください。'
