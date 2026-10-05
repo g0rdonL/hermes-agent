@@ -179,9 +179,15 @@ fetch fails, the update prints a warning, carries on, and retries the conversion
 set `maintenance.commit-graph.enabled`, `gc.writeCommitGraph` and `fetch.writeCommitGraph` to
 `false` in that checkout, because a commit-graph write over commits the graph has not seen yet
 downloads every one of their trees. Leave those settings alone, and leave `gc.auto` at its
-default so git's own automatic gc can still fold packs. The update does not fold them itself:
-on a large checkout that fold is a full repack that can run for many minutes. To fold by hand
-(with Hermes closed):
+default so git's own automatic gc can still fold packs.
+
+Each `hermes update` also spends at most 60 seconds cleaning those packs up, picking up where the
+previous update stopped. It deletes packs whose every object is also stored in another pack, then
+merges the smallest remaining packs while there are more than 50. Nothing stored locally is ever
+lost, and nothing depends on GitHub still serving it. Packs that a killed `git fetch` left pinned
+with a `.keep` file are included; git's own repack never touches those. To fold
+everything at once by hand instead (with Hermes closed; on a large checkout this is a full repack
+that can run for many minutes):
 
 ```bash
 git -C "$repo" -c gc.writeCommitGraph=false gc --auto
