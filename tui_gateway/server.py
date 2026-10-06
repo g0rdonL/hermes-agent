@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- security fix for #82010: distinguish an explicitly-empty toolset allowlist (fail closed, nothing allowed) from an absent one (no restriction); the added lines are minimal fail-closed branches at this existing chokepoint
 import atexit
 import concurrent.futures
 import contextlib
@@ -37,6 +38,8 @@ from agent.compaction_display import project_compaction_message_for_display  # n
 from agent.skill_commands import describe_skill_invocation  # noqa: F401
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX  # noqa: F401
 from tui_gateway import git_probe
+from tui_gateway.checkpoints import (_load_checkpoints_enabled, _resolve_checkpoint_hash,
+                                     resolve_checkpoints_enabled as _resolve_checkpoints_enabled)  # noqa: F401
 from tui_gateway._env import env_float, env_int
 from tui_gateway.turn_marker import clear_turn_marker, marker_writer_state, read_turn_marker, record_turn_start  # noqa: F401
 from tui_gateway.contracts import registry as _contracts
@@ -2046,7 +2049,9 @@ def _resolve_explicit_toolsets(explicit: list[str], validate_toolset) -> list[st
 def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
     """The agent's toolsets for this session (None = all): an explicit HERMES_TUI_TOOLSETS pin; else the
     coding posture (coding_context collapses to coding toolset + enabled MCP servers in a code workspace);
-    else the configured CLI toolsets. Client-surface toolsets fold in here — only this surface can answer them."""
+    else the configured CLI toolsets. Client-surface toolsets fold in here — only this surface can answer them.
+    An explicitly saved EMPTY list (``platform_toolsets.cli: []`` that resolves to nothing) is a
+    zero-tool state and returns [] — never None, which would mean unrestricted (#82010)."""
     session_platform = platform or _resolve_session_platform()
     explicit = [item.strip() for item in os.environ.get("HERMES_TUI_TOOLSETS", "").split(",") if item.strip()]
     fallback_notice = None
@@ -2068,7 +2073,7 @@ def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
         fallback_notice = "[tui] no valid HERMES_TUI_TOOLSETS entries; using configured CLI toolsets"
     try:
         from hermes_cli.config import load_config
-        from hermes_cli.tools_config import _get_platform_tools
+        from hermes_cli.tools_config import _get_platform_tools, _platform_toolsets_explicitly_saved
         cfg = load_config()
         # include_default_mcp_servers=True is the runtime variant (the agent must be able to call
         # default MCP servers); the config-editing variant would silently drop MCP tools from the TUI.
@@ -2078,7 +2083,16 @@ def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
         enabled = _get_platform_tools(cfg, "cli", include_default_mcp_servers=True)
         if fallback_notice is not None:
             _tui_notice(fallback_notice)
-        return sorted(_with_session_toolsets(enabled, session_platform)) if enabled else None
+        if enabled:
+            return sorted(_with_session_toolsets(enabled, session_platform))
+        # An explicitly saved list that resolves to nothing (``platform_toolsets.cli: []`` with no
+        # enabled MCP servers) is an explicit zero-tool state, not "no filter": fail closed with []
+        # instead of None (#82010). The client-surface fold-in must not resurrect tools the user
+        # explicitly switched off, so [] is returned bare. Only an ABSENT/unset key keeps the
+        # None = "no restriction" default below.
+        if _platform_toolsets_explicitly_saved(cfg, "cli"):
+            return []
+        return None
     except Exception:
         if fallback_notice is not None:
             _tui_notice("[tui] no valid HERMES_TUI_TOOLSETS entries and configured CLI toolsets could not be loaded; enabling all toolsets")
@@ -2683,7 +2697,7 @@ def _make_agent(
         # Builds that run before the record exists (branch, eager resume, compute host) pass it explicitly.
         user_id=auth_user_id if auth_user_id is not None else _session_auth_user_id(session),
         session_db=session_db if session_db is not None else _get_db(), ephemeral_system_prompt=system_prompt or None,
-        checkpoints_enabled=is_truthy_value(os.environ.get("HERMES_TUI_CHECKPOINTS")),
+        checkpoints_enabled=_resolve_checkpoints_enabled(cfg),
         pass_session_id=is_truthy_value(os.environ.get("HERMES_TUI_PASS_SESSION_ID")),
         skip_context_files=ignore_rules, skip_memory=ignore_rules, fallback_model=_load_fallback_model(),
         # The resolved provider's request body (a custom entry's extra_body), as the CLI/cron/gateway pass it.
@@ -2812,17 +2826,6 @@ def _any_live_session_claims_key(target: str) -> bool:
 
 def _with_checkpoints(session, fn):
     return fn(session["agent"]._checkpoint_mgr, _session_cwd(session))
-
-
-def _resolve_checkpoint_hash(mgr, cwd: str, ref: str) -> str:
-    try:
-        checkpoints = mgr.list_checkpoints(cwd)
-        idx = int(ref) - 1
-    except ValueError:
-        return ref
-    if 0 <= idx < len(checkpoints):
-        return checkpoints[idx].get("hash", ref)
-    raise ValueError(f"Invalid checkpoint number. Use 1-{len(checkpoints)}.")
 
 
 # ── Methods: session ─────────────────────────────────────────────────
