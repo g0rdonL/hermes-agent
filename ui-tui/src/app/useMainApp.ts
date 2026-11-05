@@ -19,6 +19,7 @@ import { WHEEL_SCROLL_STEP } from '../config/limits.js'
 import { RESIZE_COALESCE_MS } from '../config/timing.js'
 import { hasLeadGap, prevRenderedMsg } from '../domain/blockLayout.js'
 import { SECTION_NAMES, sectionMode } from '../domain/details.js'
+import { hasPasteChip } from '../domain/pasteExpand.js'
 import { composeTabTitle, fmtProjectCwdBranch, shortCwd } from '../domain/paths.js'
 import { type GatewayClient } from '../gatewayClient.js'
 import type { SubagentListResponse } from '../gatewayTypes.js'
@@ -47,6 +48,7 @@ import { onUserWidgets } from '../sdk/userWidgets.js'
 import type { Msg, PanelSection } from '../types.js'
 
 import { applyAgentSnapshot } from './agentRoster.js'
+import { noteLiveSessions } from './backgroundSessionNotices.js'
 import { clarifySettledRows } from './clarifyTranscript.js'
 import { createGatewayEventHandler } from './createGatewayEventHandler.js'
 import { createServerRequestHandler } from './createServerRequestHandler.js'
@@ -54,7 +56,7 @@ import { createSlashHandler } from './createSlashHandler.js'
 import { planGatewayRecovery } from './gatewayRecovery.js'
 import { getInputSelection } from './inputSelectionStore.js'
 import { type GatewayRpc, type SlashHandler, type StateSetter, type TranscriptRow, type UiState } from './interfaces.js'
-import { requestLiveSessions } from './liveSessions.js'
+import { applyLiveSessionRoster, requestLiveSessions } from './liveSessions.js'
 import { applyControlSnapshot } from './loopStatus.js'
 import { $overlayState, capturePromptResponseGuard, hasSensitivePrompt, patchOverlayState } from './overlayStore.js'
 import { $goodVibesTick } from './petFlashStore.js'
@@ -754,24 +756,8 @@ export function useMainApp(gw: GatewayClient) {
           const result = asRpcResult<SessionActiveListResponse>(raw)
 
           if (!stopped && result?.sessions) {
-            const liveSessionCount = result.sessions.length
-
-            // Surface the current session's (auto-)title for the terminal
-            // titlebar. The active_list poll already carries it, so no extra
-            // round-trip is needed.
-            const currentSid = getUiState().sid
-
-            const sessionTitle = result.sessions.find(s => s.current || s.id === currentSid)?.title?.trim() ?? ''
-
-            // Only patch when something actually changed. patchUiState always
-            // produces a new state object, which notifies every $uiState
-            // subscriber; patching unconditionally on each 1.5s poll re-renders
-            // the whole TUI and causes idle flicker.
-            const prev = getUiState()
-
-            if (prev.liveSessionCount !== liveSessionCount || prev.sessionTitle !== sessionTitle) {
-              patchUiState({ liveSessionCount, sessionTitle })
-            }
+            noteLiveSessions(gw, result.sessions, sys, () => !stopped)
+            applyLiveSessionRoster(result.sessions)
           }
         })
         .catch(() => {})
@@ -784,7 +770,7 @@ export function useMainApp(gw: GatewayClient) {
       stopped = true
       clearInterval(timer)
     }
-  }, [gw, ui.sid, ui.gatewayConnected])
+  }, [gw, sys, ui.sid, ui.gatewayConnected])
 
   // Tab title: `⚠` waiting on approval/sudo/secret/clarify, `⏳` busy, `✓` idle.
   // Format: `<marker> <session name> · <model> · <cwd>` — name/cwd omitted when absent.
@@ -1603,6 +1589,11 @@ export function useMainApp(gw: GatewayClient) {
       input: composerState.input,
       inputBuf: composerState.inputBuf,
       pagerPageSize,
+      pasteHint: composerState.pasteExpanded
+        ? ('collapse' as const)
+        : hasPasteChip(composerState.input, composerState.tokens)
+          ? ('expand' as const)
+          : null,
       queueEditIdx: composerState.queueEditIdx,
       queuedDisplay: composerState.queuedDisplay,
       submit,
