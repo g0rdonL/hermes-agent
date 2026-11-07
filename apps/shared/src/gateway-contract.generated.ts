@@ -3755,7 +3755,7 @@ export interface SessionEventsStatsResult {
   max_bytes_per_session: number
   max_bytes_process: number
 }
-/** Needs a ``template`` or ``instructions`` / ``input``; a live ``session_id`` lends its model. ``task`` is a built-in auxiliary slot or a plugin-registered one (unknown keys are refused); ``schema`` (a JSON Schema) makes the reply carry ``parsed``; ``redact`` masks secrets in ``input``. */
+/** Needs a ``template`` or ``instructions`` / ``input``; a live ``session_id`` lends its model. */
 export interface LlmOneshotParams {
   profile?: string | null
   template?: string | null
@@ -3766,12 +3766,9 @@ export interface LlmOneshotParams {
   temperature?: number | null
   max_tokens?: number | null
   session_id?: string | null
-  schema?: Record<string, unknown> | null
-  redact?: boolean | null
 }
 export interface LlmOneshotResult {
   text: string
-  parsed?: unknown | null
 }
 export interface SystemBatteryParams {
   profile?: string | null
@@ -4832,6 +4829,7 @@ export interface CanonicalSessionInfo {
   cwd?: string | null
   edit_approval_policy?: 'ask' | 'workspace_session' | 'session' | null
   launch_request?: Record<string, unknown> | null
+  client?: CanonicalClientLabel | null
   reasoning_effort?: string | null
   reasoning_effort_wire?: string | null
   service_tier?: string | null
@@ -4846,6 +4844,11 @@ export interface CanonicalSessionInfo {
   credential_hint?: string | null
   config_warning?: string | null
   [key: string]: unknown
+}
+/** The client a session's creator declared itself as (``session.create`` ``client``). */
+export interface CanonicalClientLabel {
+  name: string
+  version?: string | null
 }
 export interface SessionStatsParams {
   session_id: string
@@ -5117,6 +5120,12 @@ export interface CanonicalCreateParams {
   run_budget?: number | null
   verbose?: boolean
   client_env?: Record<string, string> | null
+  client?: CanonicalClientIdentity | null
+}
+/** A client naming itself: ``name`` matches ``[a-z0-9][a-z0-9._-]{0,63}``, ``version`` is 1-64 printable ASCII without spaces. Attribution only (owners advertising ``session-client-v1``). */
+export interface CanonicalClientIdentity {
+  name: string
+  version?: string | null
 }
 export interface CanonicalSnapshot {
   session_id: string
@@ -5191,6 +5200,7 @@ export interface CanonicalSnapshotInfo {
   cwd?: string | null
   edit_approval_policy?: 'ask' | 'workspace_session' | 'session' | null
   launch_request?: Record<string, unknown> | null
+  client?: CanonicalClientLabel | null
   reasoning_effort?: string | null
   reasoning_effort_wire?: string | null
   service_tier?: string | null
@@ -5485,6 +5495,11 @@ export interface CanonicalBotCancelResult {
   delivery_id: string
   status: 'cancelled' | 'stopping' | 'finished'
   receipt_status: string
+}
+/** Open: the plugin's handler owns every other key. ``session_id`` names the session the call acts in and passes that session's authorization first. */
+export interface PluginRpcParams {
+  session_id?: string | null
+  [key: string]: unknown
 }
 /** ``answers`` rides only on a reconnect replay (locks the server already accepted; null = skipped). */
 export interface ClarifyRequestParams {
@@ -7116,6 +7131,13 @@ export const CANONICAL_RPC_METHODS = [
   'worker.persist',
   'worker.register'
 ] as const satisfies readonly CanonicalRpcMethod[]
+
+// ── Canonical method namespaces: member names exist only at runtime (gate on `capability`) ──
+export interface CanonicalRpcNamespaces {
+  /** A method a loaded plugin registered with ctx.register_rpc; the result is its handler's JSON value. With plugin-rpc-v1 in runtime.describe, -32601 means that plugin method is not loaded; without plugin-rpc-v1, clients must not assume plugin RPC is supported. */
+  'plugin.{plugin_id}.{name}': { method: `plugin.${string}`; capability: 'plugin-rpc-v1'; params: PluginRpcParams; result: unknown }
+}
+export type CanonicalRpcNamespace = keyof CanonicalRpcNamespaces
 
 // ── Server→client requests ──
 export interface ServerRequestMap {

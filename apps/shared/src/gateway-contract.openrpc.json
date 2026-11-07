@@ -8137,6 +8137,60 @@
         "title": "CanonicalBotDeliverResult",
         "type": "object"
       },
+      "CanonicalClientIdentity": {
+        "additionalProperties": false,
+        "description": "A client naming itself: ``name`` matches ``[a-z0-9][a-z0-9._-]{0,63}``, ``version`` is 1-64\nprintable ASCII without spaces. Attribution only (owners advertising ``session-client-v1``).",
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Version"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "CanonicalClientIdentity",
+        "type": "object"
+      },
+      "CanonicalClientLabel": {
+        "additionalProperties": false,
+        "description": "The client a session's creator declared itself as (``session.create`` ``client``).",
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Version"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "CanonicalClientLabel",
+        "type": "object"
+      },
       "CanonicalConfigGetResult": {
         "additionalProperties": false,
         "properties": {
@@ -8848,6 +8902,17 @@
             ],
             "default": null,
             "title": "Client Env"
+          },
+          "client": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CanonicalClientIdentity"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           }
         },
         "title": "CanonicalCreateParams",
@@ -10371,6 +10436,17 @@
             "default": null,
             "title": "Launch Request"
           },
+          "client": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CanonicalClientLabel"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
           "reasoning_effort": {
             "anyOf": [
               {
@@ -11181,6 +11257,17 @@
             ],
             "default": null,
             "title": "Launch Request"
+          },
+          "client": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CanonicalClientLabel"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           },
           "reasoning_effort": {
             "anyOf": [
@@ -22641,7 +22728,7 @@
       },
       "LlmOneshotParams": {
         "additionalProperties": false,
-        "description": "Needs a ``template`` or ``instructions`` / ``input``; a live ``session_id`` lends its model.\n``task`` is a built-in auxiliary slot or a plugin-registered one (unknown keys are refused);\n``schema`` (a JSON Schema) makes the reply carry ``parsed``; ``redact`` masks secrets in ``input``.",
+        "description": "Needs a ``template`` or ``instructions`` / ``input``; a live ``session_id`` lends its model.",
         "properties": {
           "profile": {
             "anyOf": [
@@ -22751,31 +22838,6 @@
             ],
             "default": null,
             "title": "Session Id"
-          },
-          "schema": {
-            "anyOf": [
-              {
-                "additionalProperties": true,
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Schema"
-          },
-          "redact": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Redact"
           }
         },
         "title": "LlmOneshotParams",
@@ -22787,16 +22849,6 @@
           "text": {
             "title": "Text",
             "type": "string"
-          },
-          "parsed": {
-            "anyOf": [
-              {},
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Parsed"
           }
         },
         "required": [
@@ -28288,6 +28340,26 @@
         ],
         "title": "PluginRestartTarget",
         "type": "string"
+      },
+      "PluginRpcParams": {
+        "additionalProperties": true,
+        "description": "Open: the plugin's handler owns every other key. ``session_id`` names the session the call\nacts in and passes that session's authorization first.",
+        "properties": {
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Session Id"
+          }
+        },
+        "title": "PluginRpcParams",
+        "type": "object"
       },
       "PluginScanFinding": {
         "additionalProperties": false,
@@ -49848,6 +49920,26 @@
         "schema": {
           "$ref": "#/components/schemas/WorkerExecution"
         }
+      }
+    }
+  ],
+  "x-canonical-namespaces": [
+    {
+      "name": "plugin.{plugin_id}.{name}",
+      "summary": "A method a loaded plugin registered with ctx.register_rpc; the result is its handler's JSON value. With plugin-rpc-v1 in runtime.describe, -32601 means that plugin method is not loaded; without plugin-rpc-v1, clients must not assume plugin RPC is supported.",
+      "x-prefix": "plugin.",
+      "x-capability": "plugin-rpc-v1",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/PluginRpcParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {}
       }
     }
   ],
