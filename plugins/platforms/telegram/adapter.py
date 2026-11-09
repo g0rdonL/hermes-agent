@@ -28,8 +28,10 @@ from gateway.platforms._shared import (
 )
 
 
-def _redact_telegram_error_text(error: object) -> str:
-    """Redact secrets from Telegram transport errors before logging or returning them."""
+def _redact_telegram_error_text(error: object, proxy_url: str | None = None) -> str:
+    """Secret-redacted error text; only type + proxy host:port when the proxy URL holds a secret the text may echo."""
+    if proxy_url and isinstance(error, BaseException) and (shown := describe_proxy_error(error, proxy_url)):
+        return shown
     text = "" if error is None else str(error)
     if not text:
         # httpx timeout exceptions (ConnectTimeout, ReadTimeout, ...) stringify to "" — keep the
@@ -144,23 +146,18 @@ from agent.i18n import get_language, t
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter, ExecApprovalPrompt, SendResult, classify_send_error, unauthorized_action_notice,
-    cache_image_from_bytes_async, cache_audio_from_bytes_async, cache_video_from_bytes_async, resolve_proxy_url, SUPPORTED_VIDEO_TYPES,
-    SUPPORTED_DOCUMENT_TYPES, SUPPORTED_IMAGE_DOCUMENT_TYPES, _TEXT_INJECT_EXTENSIONS, utf16_len,
+    cache_image_from_bytes_async, cache_audio_from_bytes_async, cache_video_from_bytes_async, resolve_proxy_url, safe_proxy_url_for_log, describe_proxy_error, SUPPORTED_VIDEO_TYPES,
+    SUPPORTED_DOCUMENT_TYPES, SUPPORTED_IMAGE_DOCUMENT_TYPES, _TEXT_INJECT_EXTENSIONS, utf16_len, env_proxy_for_redaction,
 )
 
-# Telegram truncates ``answerCallbackQuery`` text at 200 chars; ``BotCommand`` descriptions at 256.
-_TOAST_LIMIT = 200
-_BOT_COMMAND_DESCRIPTION_LIMIT = 256
+_BOT_COMMAND_DESCRIPTION_LIMIT = 256  # Telegram's ``BotCommand`` description cap
 
 
-def _unauthorized() -> str:
-    """Every refused button tap answers with the same sentence — resolved per tap so the active
-    language applies (never bound at import)."""
+def _unauthorized() -> str:  # one sentence for every refused tap, resolved per tap (never bound at import)
     return unauthorized_action_notice(Platform.TELEGRAM)[:_TOAST_LIMIT]
 
 
-def _toast(key: str, **kwargs: Any) -> str:
-    """``t()`` for ``query.answer(text=...)`` payloads, cut at Telegram's 200-char toast cap."""
+def _toast(key: str, **kwargs: Any) -> str:  # ``t()`` for ``query.answer(text=...)``, cut at the toast cap
     return t(key, **kwargs)[:_TOAST_LIMIT]
 
 
@@ -180,17 +177,23 @@ _MEDIA_KIND_KEYS = {
     "video file": "platform.telegram.media.kind_video", "video note": "platform.telegram.media.kind_video"}
 
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
+from plugins.platforms.telegram.telegram_audio_meta import (
+    _coerce_duration_seconds, _probe_voice_duration_seconds, audio_player_fields, fit_thumbnail_jpeg)
 from plugins.platforms.telegram.telegram_entities import expand_link_entities
 from plugins.platforms.telegram.telegram_held_inbound import TelegramHeldInboundMixin
+from plugins.platforms.telegram.telegram_polling_probe import TelegramPendingProbeMixin
+from plugins.platforms.telegram.telegram_intake import effective_update_message
 from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id, parse_send_target, parse_telegram_message_id
 from plugins.platforms.telegram.telegram_resolved_prompt import edit_keeping_prompt
+from plugins.platforms.telegram.telegram_clarify_binding import ClarifyPrompt, log_resolved, tap_matches_prompt
 from plugins.platforms.telegram.telegram_topic_transfer import TopicTransferFn, apply_root_dm_topic_transfer
+from plugins.platforms.telegram.callback_answer import TOAST_LIMIT as _TOAST_LIMIT, answer_callback, answer_or_note
 from plugins.platforms.telegram.telegram_network import (
     SEED_FALLBACK_IPS, TelegramFallbackTransport, discover_fallback_ips, parse_fallback_ip_env, tcp_keepalive_socket_options)
 from plugins.platforms.telegram.telegram_topic_routing import TelegramTopicRoutingMixin
 from utils import env_float, env_int
 
-_TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+_TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".heic", ".heif", ".avif"}
 # Max seconds a send/edit may sleep inline on a flood-control RetryAfter; longer penalties fail
 # closed with ``flood_control:{wait}`` so the caller's retry machinery owns the wait.
 # Longer server penalties fail closed with a ``flood_control:{wait}`` SendResult so the caller's retry
@@ -213,52 +216,8 @@ def _flood_cap_result(wait: float) -> SendResult:
     return SendResult(success=False, error=f"flood_control:{wait}", retry_after=float(wait))
 
 
-_TELEGRAM_IMAGE_MIME_TO_EXT = {"image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/webp": ".webp", "image/gif": ".gif"}
-_TELEGRAM_IMAGE_EXT_TO_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif"}
-
-
-def _coerce_duration_seconds(value: Any) -> Optional[int]:
-    """Round a raw length to whole positive seconds, or None if unusable."""
-    try:
-        secs = round(float(value))
-    except (TypeError, ValueError):
-        return None
-    return secs if secs > 0 else None
-
-
-def _probe_voice_duration_seconds(path: str) -> Optional[int]:
-    """Best-effort whole-second audio length (wave → mutagen → ffprobe; None if unreadable).
-
-    Telegram renders long clips as 0:00 without an explicit duration. Blocking: use ``to_thread``."""
-    if os.path.splitext(path)[1].lower() == ".wav":
-        try:
-            import wave
-            with wave.open(path, "rb") as wf:
-                rate = wf.getframerate() or 0
-                secs = _coerce_duration_seconds(wf.getnframes() / float(rate)) if rate else None
-            if secs is not None:
-                return secs
-        except Exception:
-            pass
-    try:
-        import mutagen
-        secs = _coerce_duration_seconds(getattr(getattr(mutagen.File(path), "info", None), "length", None))
-        if secs is not None:
-            return secs
-    except Exception:
-        pass
-    try:
-        import shutil
-        import subprocess
-        if shutil.which("ffprobe"):
-            proc = subprocess.run(
-                ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path],
-                stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5, check=False)
-            if proc.returncode == 0:
-                return _coerce_duration_seconds(proc.stdout.strip())
-    except Exception:
-        pass
-    return None
+_TELEGRAM_IMAGE_EXT_TO_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif", ".heic": "image/heic", ".heif": "image/heif", ".avif": "image/avif"}
+_TELEGRAM_IMAGE_MIME_TO_EXT = {"image/jpg": ".jpg", **{m: e for e, m in _TELEGRAM_IMAGE_EXT_TO_MIME.items() if e != ".jpeg"}}
 
 
 def _probe_video_geometry(path: str) -> dict[str, int]:
@@ -295,36 +254,12 @@ def _probe_video_geometry(path: str) -> dict[str, int]:
 
 
 def _video_thumbnail_jpeg(path: str, duration: Optional[int]) -> Optional[str]:
-    """Write a 320px-wide JPEG frame for Telegram's ``thumbnail`` field; None on failure.
+    """A JPEG frame fitted inside 320x320 for Telegram's ``thumbnail`` field; None on failure.
 
     Telegram keeps a supplied thumbnail for the uploads it did not process itself — without one the
     chat shows a square placeholder tile until the video is opened.
     """
-    out = None
-    try:
-        import shutil
-        import subprocess
-        import tempfile
-        if not shutil.which("ffmpeg"):
-            return None
-        seek = max(1, int((duration or 3) * 0.25))
-        fd, out = tempfile.mkstemp(suffix=".jpg", prefix="hermes-tg-thumb-")
-        os.close(fd)
-        proc = subprocess.run(
-            ["ffmpeg", "-y", "-ss", str(seek), "-i", path, "-frames:v", "1",
-             "-vf", "scale=320:-2", "-q:v", "6", out],
-            stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, check=False)
-        if proc.returncode != 0 or not os.path.getsize(out):
-            with contextlib.suppress(OSError):
-                os.remove(out)
-            return None
-        return out
-    except Exception:
-        logger.debug("[Telegram] video thumbnail extraction failed for %s", path, exc_info=True)
-        if out:
-            with contextlib.suppress(OSError):
-                os.remove(out)
-        return None
+    return fit_thumbnail_jpeg(path, seek=max(1, int((duration or 3) * 0.25)), timeout=30)
 
 
 def telegram_deps_present() -> bool:
@@ -476,6 +411,9 @@ _POLLING_PROGRESS_TIMEOUT = 60.0  # generation unhealthy until getUpdates return
 # #92991) and no other probe can see it. ~3x the worst-case poll window leaves ample margin against false
 # positives while still recovering within a few heartbeat intervals.
 _POLLING_STALL_TIMEOUT = 150.0
+# Sustained getUpdates progress this long, counted from the first progress after the last 409's restart, ends a
+# conflict episode; it exceeds the gap between two conflicts of one storm (the next poll), so the ladder can climb.
+_POLLING_CONFLICT_QUIET_PERIOD = 120.0
 # Ingress dispatch stall (#102260, #130407): the transport probes prove getUpdates round-trips complete, not
 # that PTB's dispatcher ever handed the fetched updates to a handler. A backlog with no dispatch progress for
 # four heartbeats (360s) hands the adapter to the supervisor for a rebuild (an in-place restart keeps the
@@ -516,14 +454,16 @@ class _PollingStallError(RuntimeError):
     """
 
 
-class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BasePlatformAdapter):
+class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, TelegramPendingProbeMixin, BasePlatformAdapter):
     """Telegram bot adapter: users/groups, MarkdownV2 replies, forum topics, media."""
 
     # Bound for the per-(chat_id, status_key) status-message cache; FIFO half-trim on overflow.
     _STATUS_MESSAGE_IDS_MAX = 2000
+    _ptb_proxy_url: str | None = None  # set by _build_ptb_requests; error text then shows no detail
 
     MAX_MESSAGE_LENGTH = 4096
     supports_code_blocks = True  # MarkdownV2 renders fenced code blocks
+    allow_from_covers_groups = True  # allow_from is global (DMs + groups); group_allow_from adds group-only users
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
     RICH_MESSAGE_MAX_CHARS = 32768  # Bot API 10.1 rich cap; above it use legacy chunking
     _SPLIT_THRESHOLD = 4000  # chunk near this length ⇒ a client-side split continuation is almost certain
@@ -651,7 +591,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         self._bot_identity_refresh_task: Optional[asyncio.Task] = None
         self._post_connect_task: Optional[asyncio.Task] = None  # command menu + DM topics, off the connect path
         self._polling_conflict_count = self._polling_network_error_count = self._polling_generation = 0
-        self._polling_conflict_recovery_generation: Optional[int] = None
+        self._polling_conflict_quiet_since: Optional[float] = None
         self._polling_progress_event = asyncio.Event()
         self._polling_progress_accepting = self._polling_teardown_started = False
         self._polling_error_callback_ref = None
@@ -713,7 +653,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         self._approval_state: dict[int, str] = {}  # message_id → session_key
         self._approval_request_ids: dict[int, str] = {}  # message_id → tools.approval request id
         self._slash_confirm_state: dict[str, str] = {}  # confirm_id → session_key
-        self._clarify_state: dict[str, str] = {}  # clarify_id → session_key
+        self._clarify_state: dict[str, ClarifyPrompt] = {}  # clarify_id → prompt bound to its sent message
         # "important" (default): only final responses, approvals and slash confirmations notify;
         # "all": every message notifies (display.platforms.telegram.notifications).
         self._notifications_mode: str = "important"
@@ -961,21 +901,20 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         if not user_id:
             return True
         authorized: Optional[bool] = None
-        # Adapter-level allow_from (DMs) / group_allow_from (groups) are the sole authority if set.
-        adapter_allow_from = self.config.extra.get(
-            "group_allow_from" if (source.chat_type or "") in ("group", "forum", "channel") else "allow_from")
-        if adapter_allow_from is not None:
-            allowed = _coerce_allow_set(adapter_allow_from)
-            authorized = user_id in allowed or "*" in allowed
+        # allow_from (everywhere) / group_allow_from (groups) GRANT; a miss defers to the runner's union (#68716).
+        is_group = (source.chat_type or "") in ("group", "forum", "channel")
+        lists = [self.config.extra.get(key) for key in (("allow_from", "group_allow_from") if is_group else ("allow_from",))]
+        adapter_allow_from = None if all(v is None for v in lists) else set().union(*map(_coerce_allow_set, lists))
+        if adapter_allow_from is not None and {user_id, "*"} & adapter_allow_from:
+            return True
         # Instance-level override only (tests): the class method _is_callback_user_authorized is for
         # inline buttons and must not become a user-id-only shortcut for real messages.
-        if authorized is None:
-            callback_auth = self.__dict__.get("_is_callback_user_authorized")
-            if callable(callback_auth):
-                with contextlib.suppress(Exception):
-                    authorized = bool(callback_auth(
-                        user_id, chat_id=source.chat_id, chat_type=source.chat_type, thread_id=source.thread_id,
-                        user_name=source.user_name))
+        callback_auth = self.__dict__.get("_is_callback_user_authorized")
+        if callable(callback_auth):
+            with contextlib.suppress(Exception):
+                authorized = bool(callback_auth(
+                    user_id, chat_id=source.chat_id, chat_type=source.chat_type, thread_id=source.thread_id,
+                    user_name=source.user_name))
         if authorized is None:
             # Runner's full auth chain; prefer the set_authorization_check callback (survives multiplex
             # handler wrapping, unlike bound-handler __self__).
@@ -983,7 +922,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             has_callback = getattr(self, "_authorization_check", None) is not None
             if has_callback or auth_fn is not None:
                 # No allowlist → unknown DMs must reach pairing, not be default-denied here.
-                if not self._telegram_auth_env_configured():
+                if adapter_allow_from is None and not self._telegram_auth_env_configured():
                     return True
                 decision = self._is_sender_authorized(
                     user_id, chat_type=source.chat_type, chat_id=source.chat_id, is_bot=source.is_bot,
@@ -997,7 +936,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                         logger.debug("[Telegram] Falling back to env-only auth for user %s", user_id, exc_info=True)
         if authorized is None:
             authorized = self._env_allowlist_decision(user_id)
-            if authorized is None:
+            if authorized is None and adapter_allow_from is None:
                 return True
         if authorized:
             return True
@@ -1689,10 +1628,10 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         self._polling_progress_event = asyncio.Event()
         self._polling_progress_accepting = True
         self._send_path_degraded = True
-        # Reset stall-watchdog timestamps: no proven progress yet, age measured from here.
-        # See #92991.
+        # No proven progress yet: stall-watchdog age (#92991) and the conflict quiet window restart
+        # here, so a network recovery's downtime never counts as sustained healthy polling.
         self._polling_generation_started_monotonic = time.monotonic()
-        self._polling_last_progress_monotonic = None
+        self._polling_last_progress_monotonic = self._polling_conflict_quiet_since = None
         # Re-base the backlog per generation. On an in-place updater restart PTB keeps the old
         # update_queue, so old dispatches can briefly exceed received; the check treats that as no backlog.
         self._updates_received_total = self._updates_dispatched_total = 0
@@ -1711,10 +1650,16 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         self._polling_progress_event.set()
         self._polling_last_progress_monotonic = time.monotonic()
         self._polling_network_error_count = 0
-        if generation == self._polling_conflict_recovery_generation:
-            self._polling_conflict_recovery_generation = None
-        else:
-            self._polling_conflict_count = 0
+        # A conflict episode ends only after a quiet period: getUpdates also succeeds between the 409s of a
+        # live storm, so resetting on any progress pinned the ladder at (1/5) forever (#82303). The window opens
+        # at the first progress after the restart, so recovery downtime (stop, backoff, drain) never counts.
+        if self._polling_conflict_count:
+            quiet_since = self._polling_conflict_quiet_since
+            if quiet_since is None:
+                self._polling_conflict_quiet_since = self._polling_last_progress_monotonic
+            elif self._polling_last_progress_monotonic - quiet_since >= _POLLING_CONFLICT_QUIET_PERIOD:
+                self._polling_conflict_count = 0
+                self._polling_conflict_quiet_since = None
         # First proof getUpdates is flowing for this generation: flip a
         # published "retrying" (degraded connect, reconnect stamp, or the
         # mid-session recovery below) back to "connected" (#101391).
@@ -2008,13 +1953,22 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         self._set_fatal_error("telegram_network_error", message, retryable=True)
         await self._handoff_polling_fatal_error()
 
-    async def _stop_updater_or_go_fatal(self, app, what: str) -> bool:
+    async def _stop_updater_or_go_fatal(self, app, what: str, *, skip_read_receipt_cleanup: bool = False) -> bool:
         """Bounded ``updater.stop()`` before a recovery restart; False = went fatal, caller returns.
 
         Wall-clock deadline, not asyncio.wait_for: a CLOSE-WAIT socket wedges stop() on epoll and PTB/AnyIO shielded cleanup
         hangs wait_for. On timeout the Updater's lifecycle lock may still be held, so rebuild the adapter instead."""
         try:
             if app and app.updater and app.updater.running:
+                if skip_read_receipt_cleanup:
+                    # PTB's stop() finishes with a read-receipt getUpdates(timeout=0) that re-uses the very
+                    # pool the network error just broke; its getUpdates read timeout outlives the stop
+                    # deadline, so every transient error wedges stop() for the whole budget and escalates
+                    # to a full adapter rebuild (#131783). A same-Updater restart resumes from
+                    # _last_update_id, and admission receipts (#120257) dedupe the at-most-one unconfirmed
+                    # batch, so a no-op receipt costs no redelivery (None logs PTB's false refetch WARNING).
+                    if getattr(app.updater, "_Updater__polling_cleanup_cb", None) is not None:
+                        app.updater._Updater__polling_cleanup_cb = lambda: asyncio.sleep(0)
                 try:
                     await _await_with_thread_deadline(app.updater.stop(), timeout=_UPDATER_STOP_TIMEOUT)
                 except TimeoutError:
@@ -2059,12 +2013,12 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         if attempt > MAX_NETWORK_RETRIES:
             message = (
                 f'Telegram polling could not reconnect after {MAX_NETWORK_RETRIES:d} network error retries. Escalating to gateway recovery.')
-            await self._go_fatal_network(message, "[%s] %s Last error: %s", self.name, message, _redact_telegram_error_text(error))
+            await self._go_fatal_network(message, "[%s] %s Last error: %s", self.name, message, _redact_telegram_error_text(error, self._ptb_proxy_url))
             return
         delay = min(BASE_DELAY * (2 ** (attempt - 1)), MAX_DELAY)
         logger.warning(
             "[%s] Telegram network error (attempt %d/%d), reconnecting in %ds. Error: %s", self.name, attempt,
-            MAX_NETWORK_RETRIES, delay, _redact_telegram_error_text(error))
+            MAX_NETWORK_RETRIES, delay, _redact_telegram_error_text(error, self._ptb_proxy_url))
         await asyncio.sleep(delay)
         if self._teardown_started:
             return
@@ -2072,7 +2026,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         app = self._app
         # Unguarded stop() on a CLOSE-WAIT socket would leave _polling_error_task perpetually
         # "in-flight" so every probe skips reconnect for hours.
-        if not await self._stop_updater_or_go_fatal(app, "network-recovery") or self._teardown_started:
+        if not await self._stop_updater_or_go_fatal(app, "network-recovery", skip_read_receipt_cleanup=True) or self._teardown_started:
             return
         # start_polling() bootstraps through the *general* pool before getUpdates; a confirmed pool timeout means the request
         # was never sent, so rebuilding that pool is safe. Generic network errors stay polling-only (sends untouched).
@@ -2094,7 +2048,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         except Exception as retry_err:
             if self._teardown_started:
                 return
-            logger.warning("[%s] Telegram polling reconnect failed: %s", self.name, _redact_telegram_error_text(retry_err))
+            logger.warning("[%s] Telegram polling reconnect failed: %s", self.name, _redact_telegram_error_text(retry_err, self._ptb_proxy_url))
             # Polling is dead and no more error callbacks will fire — chain the retry ourselves.
             if not self.has_fatal_error and not self._teardown_started:
                 task = asyncio.ensure_future(self._handle_polling_network_error(retry_err))
@@ -2111,6 +2065,14 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         connect-level failures feed ``_handle_polling_network_error``. Runs for the connection's lifetime, catching
         steady-state wedges the one-shot verifier can't."""
         HEARTBEAT_INTERVAL = 90   # seconds between probes
+        # Re-probe delay after a first stuck-pending observation: the second confirming observation must
+        # not wait a full HEARTBEAT_INTERVAL. Power-napping hosts (macOS Sleep↔DarkWake cycling, ~45s
+        # awake per ~16min) only run the loop inside short awake windows, so two probes spaced a whole
+        # heartbeat apart never land in the same window and the escalation can never complete — observed
+        # as seven first-stuck probes, zero confirmations, over 39 days (#139281). 30s still dwarfs the
+        # healthy transient (an update queued between arrival and the next getUpdates return, sub-second)
+        # while fitting probe + re-probe inside one awake window.
+        STUCK_CONFIRM_INTERVAL = 30
         PROBE_TIMEOUT = 15        # seconds before declaring the path dead
         # Wedged-recovery watchdog: note when a recovery task is first seen in-flight and force-escalate
         # if the *same* task object still runs past the stuck timeout.
@@ -2121,9 +2083,10 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         # long-lived task is unambiguously wedged. See #66377.
         stuck_task_ref: Optional[asyncio.Task] = None
         stuck_task_since = 0.0
+        next_interval = HEARTBEAT_INTERVAL
         while True:
             try:
-                await asyncio.sleep(HEARTBEAT_INTERVAL)
+                await asyncio.sleep(next_interval)
                 if self._teardown_started or self.has_fatal_error:
                     return
                 # A recovery task hung on an unbounded await gates every other recovery path forever
@@ -2168,97 +2131,31 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                 # getUpdates consumer is alive: PTB can report updater.running=True while the long-poll task
                 # is wedged, so DMs queue in the Bot API and never reach handlers (#42909). get_me() is
                 # blind to this; get_webhook_info() exposes it via pending_update_count. Escalate only after
-                # two consecutive probes see a non-zero queue while we believe we're polling, so a single
-                # in-flight update (consumed before the next probe) never trips recovery.
-                await self._probe_pending_updates(bot, PROBE_TIMEOUT)
+                # two probes see a non-zero queue while we believe we're polling, so a single in-flight
+                # update (consumed before the next probe) never trips recovery — but the confirming probe
+                # runs after STUCK_CONFIRM_INTERVAL, not a full heartbeat, so the pair can complete inside
+                # one awake window on power-napping hosts (#139281).
+                queue_suspect = await self._probe_pending_updates(bot, PROBE_TIMEOUT)
                 # An empty queue can't hide a wedge forever: no round-trip past the stall threshold ⇒ dead.
                 # Even an empty queue cannot hide a wedged long-poll forever: Telegram answers within ~50s,
                 # so a consumer with no successful round-trip past the stall threshold is dead (#92991).
                 # Pure local-state check — no Bot API call needed.
                 await self._check_polling_stall()
-                # Transport health is not dispatch health (#102260). Pure local-state check.
-                self._check_ingress_dispatch_stall()
+                # Transport health is not dispatch health (#102260). Pure local-state check. It counts passes as
+                # full heartbeats, so a short confirm pass must not count or a slow handler trips it early.
+                if next_interval == HEARTBEAT_INTERVAL:
+                    self._check_ingress_dispatch_stall()
+                next_interval = STUCK_CONFIRM_INTERVAL if queue_suspect else HEARTBEAT_INTERVAL
             except asyncio.CancelledError:
                 return
             except (TimeoutError, OSError) as probe_err:
                 self._schedule_polling_recovery(probe_err, reason="heartbeat probe")
+                next_interval = HEARTBEAT_INTERVAL
             except Exception as probe_err:
                 # Non-connectivity errors (e.g. TelegramError 401) aren't CLOSE-WAIT symptoms.
                 if self._looks_like_network_error(probe_err):
                     self._schedule_polling_recovery(probe_err, reason="heartbeat probe")
-
-    async def _probe_pending_updates(self, bot, probe_timeout: float) -> None:
-        """Detect a wedged or stopped getUpdates consumer via pending_update_count.
-
-        PTB can report ``updater.running`` while the long-poll is stuck; get_me() stays healthy yet DMs queue in the
-        Bot API. A stuck queue over two consecutive probes ⇒ dead consumer. Also covers the updater having stopped
-        entirely (``running=False``, no reconnect in flight).
-
-        PTB can report ``updater.running == True`` while its long-poll task is silently stuck (e.g. a socket
-        that epoll keeps reporting readable on WSL2). ``get_me()`` stays healthy because it uses the general
-        request path, so the CLOSE-WAIT heartbeat never fires — yet DMs queue in the Bot API and never reach
-        handlers (#42909).
-        We detect the stopped updater directly and feed the same ladder (#55769).
-        """
-        # Polling mode only: in webhook mode Telegram pushes and holds no server-side queue.
-        if self._teardown_started or self._webhook_mode:
-            return
-        # An in-flight reconnect owns recovery — don't double-trigger, and don't misread its brief
-        # stop()->start_polling() window (updater.running transiently False) as dead.
-        if self._recovery_in_flight():
-            self._polling_not_running_count = 0
-            return
-        updater = getattr(self._app, "updater", None) if self._app else None
-        if updater is None:
-            self._polling_pending_stuck_count = 0
-            return
-        if not getattr(updater, "running", False):
-            # Long-poll task gone, general-path calls still succeed, so no error_callback/probe ever
-            # fires. Debounced over two probes so a just-starting updater never trips it.
-            self._polling_pending_stuck_count = 0
-            # We are in polling mode with no reconnect in flight, yet PTB's updater has stopped entirely.
-            # This is distinct from the wedged-but-running consumer handled below: the long-poll task is
-            # gone, get_me()/get_webhook_info() on the general request path still succeed, so no
-            # error_callback or connectivity probe ever fires and the gateway silently stops receiving
-            # messages while the process stays alive (#55769).
-            self._polling_not_running_count += 1
-            logger.warning(
-                "[%s] Telegram polling heartbeat: updater stopped while in polling mode (stuck probe %d/2)", self.name,
-                self._polling_not_running_count)
-            if self._polling_not_running_count >= 2:
-                self._polling_not_running_count = 0
-                self._escalate_stuck_consumer(
-                    "[%s] Telegram updater is not running (long-poll task gone); triggering polling restart",
-                    "Telegram updater stopped while in polling mode")
-            return
-        self._polling_not_running_count = 0
-        get_webhook_info = getattr(bot, "get_webhook_info", None)
-        if not callable(get_webhook_info):
-            return
-        try:
-            info = await asyncio.wait_for(get_webhook_info(), probe_timeout)  # type: ignore[arg-type]
-        except (TimeoutError, OSError):
-            return  # connectivity symptom for the get_me() path, not a stuck-queue signal
-        pending = int(getattr(info, "pending_update_count", 0) or 0)
-        if pending <= 0:
-            self._polling_pending_stuck_count = 0
-            return
-        self._polling_pending_stuck_count += 1
-        logger.warning(
-            "[%s] Telegram polling heartbeat: %d update(s) queued but not consumed (stuck probe %d/2)", self.name,
-            pending, self._polling_pending_stuck_count)
-        if self._polling_pending_stuck_count >= 2:
-            self._polling_pending_stuck_count = 0
-            self._escalate_stuck_consumer(
-                "[%s] getUpdates consumer appears wedged (queue not draining); triggering polling restart",
-                "getUpdates consumer wedged: pending updates not draining")
-
-    def _escalate_stuck_consumer(self, log_message: str, reason: str) -> None:
-        """Second consecutive stuck probe: restart polling via the network-error ladder (unless tearing down)."""
-        if self._teardown_started:
-            return
-        logger.warning(log_message, self.name)
-        self._polling_error_task = asyncio.get_running_loop().create_task(self._handle_polling_network_error(RuntimeError(reason)))
+                next_interval = HEARTBEAT_INTERVAL
 
     def _check_ingress_dispatch_stall(self) -> None:
         """Escalate fetched updates PTB's dispatcher is not handing to handlers (#102260, #130407).
@@ -2400,6 +2297,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         if self.has_fatal_error and self.fatal_error_code == "telegram_polling_conflict":
             return
         self._polling_conflict_count += 1
+        self._polling_conflict_quiet_since = None
         MAX_CONFLICT_RETRIES = 5
         # 15s, 25s, 35s, 45s, 55s — clears Telegram's ~30s session window without hammering the API.
         RETRY_DELAY = 10 + (self._polling_conflict_count * 10)  # seconds
@@ -2418,25 +2316,19 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             await self._drain_polling_connections()
             if self._teardown_started:
                 return
-            # Stable local ref: a concurrent disconnect() may null self._app across the awaits above.
             app = self._app
             # Capture a stable local reference: self._app can be reassigned to None by a concurrent
             # disconnect() while we're suspended across the awaits above (same race #55992 fixed on the
             # network path). Re-reading self._app after that point would raise AttributeError deep inside
             # start_polling instead of failing fast here, where the except below reschedules or escalates to
             # fatal.
-            expected_generation = self._polling_generation + 1
             if not app:
                 raise RuntimeError("Telegram application was torn down during conflict reconnect")
-            # drop_pending_updates=True makes Telegram terminate any other getUpdates session for this
-            # token (zombie or our own prior retry); without it each retry is immediately 409'd.
-            # The competing session is either a zombie from the previous gateway process (whose long-poll
-            # hasn't expired server-side yet) or our own previous retry's still-expiring session. Without
-            # this, each retry starts a new getUpdates session that immediately gets 409'd by the previous
-            # one, creating the very conflict we are trying to recover from (#75017).
-            self._polling_conflict_recovery_generation = expected_generation
+            # Keep the server-side queue: drop_pending_updates only empties it (PTB calls deleteWebhook either
+            # way), so True silently discarded every message sent during the conflict (#143871). The
+            # self-perpetuating 409 loop of #75017 is stopped by _disarm_ptb_retry_loop.
             try:
-                await self._start_polling_once(app, drop_pending_updates=True, error_callback=self._polling_error_callback_ref)
+                await self._start_polling_once(app, drop_pending_updates=False, error_callback=self._polling_error_callback_ref)
                 logger.info(
                     "[%s] Telegram polling restarted after conflict retry %d/%d; health pending getUpdates progress",
                     self.name, self._polling_conflict_count, MAX_CONFLICT_RETRIES)
@@ -2448,16 +2340,13 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                     return
                 logger.warning(
                     "[%s] Telegram polling retry %d/%d failed: %s. Scheduling next attempt.", self.name,
-                    self._polling_conflict_count, MAX_CONFLICT_RETRIES, _redact_telegram_error_text(retry_err))
+                    self._polling_conflict_count, MAX_CONFLICT_RETRIES, _redact_telegram_error_text(retry_err, self._ptb_proxy_url))
                 # Never return silently: alive-and-"connected" with no polling is limbo.
                 if self._polling_conflict_count < MAX_CONFLICT_RETRIES and not self._teardown_started:
                     # get_running_loop(): get_event_loop() raises on 3.10+ from PTB's callback context.
                     self._restart_polling_in_task(self._handle_polling_conflict(retry_err))
                     return
                 # Fall through to fatal on the last retry.
-            finally:
-                if self._polling_conflict_recovery_generation == expected_generation:
-                    self._polling_conflict_recovery_generation = None
         if self._teardown_started:
             return
         # Retries exhausted — fatal so the runner surfaces it and the user knows to act.
@@ -2467,7 +2356,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             "The previous gateway session is still held open on Telegram's servers, "
             "or another process is using the same bot token. To recover: ensure no other Hermes or OpenClaw instance is running "
             "with this token, then restart the gateway with 'hermes gateway restart'.")
-        logger.error("[%s] %s Original error: %s", self.name, message, _redact_telegram_error_text(error))
+        logger.error("[%s] %s Original error: %s", self.name, message, _redact_telegram_error_text(error, self._ptb_proxy_url))
         # Snapshot whether WE transition to fatal: a concurrent retry task suspended past the entry
         # guard reaches this branch too. Only the first transition notifies.
         _already_fatal = self.has_fatal_error and self.fatal_error_code == "telegram_polling_conflict"
@@ -2629,8 +2518,9 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             logger.warning("[%s] Failed to persist thread_id to config: %s", self.name, e, exc_info=True)
 
     async def _setup_dm_topics(self) -> None:
-        """Load or create configured DM topics: ``extra['dm_topics']`` is ``[{"chat_id", "topics": [{"name",
-        "icon_color", "thread_id"?, "skill"?}]}]``; persisted thread_ids are cached without an API call."""
+        """Load or create ``extra['dm_topics']`` (``[{"chat_id", "topics": [{"name", "thread_id"?, ...}]}]``). Merges the
+        thread_ids saved since boot first: a rebuilt adapter's boot-time snapshot predates them (#132522)."""
+        self._merge_saved_dm_topic_ids()
         for chat_entry in self._dm_topics_config or ():
             chat_id = chat_entry.get("chat_id")
             topics = chat_entry.get("topics", [])
@@ -2642,9 +2532,9 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                 if not topic_name:
                     continue
                 cache_key = f"{chat_id}:{topic_name}"
-                existing_thread_id = topic_conf.get("thread_id")
-                if existing_thread_id:
-                    self._dm_topics[cache_key] = int(existing_thread_id)
+                existing_thread_id = topic_conf.get("thread_id") or self._dm_topics.get(cache_key)  # unsaved id
+                if existing_thread_id:  # a reused unsaved id goes back into topic_conf: configured_channels() lists it
+                    self._dm_topics[cache_key] = topic_conf["thread_id"] = int(existing_thread_id)
                     logger.info("[%s] DM topic loaded from config: %s -> thread_id=%s", self.name, cache_key, existing_thread_id)
                     continue
                 thread_id = await self._create_dm_topic(
@@ -2652,8 +2542,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                     icon_custom_emoji_id=topic_conf.get("icon_custom_emoji_id"))
                 if not thread_id:
                     continue
-                self._dm_topics[cache_key] = thread_id
-                logger.info("[%s] DM topic cached: %s -> thread_id=%s", self.name, cache_key, thread_id)
+                self._dm_topics[cache_key] = topic_conf["thread_id"] = thread_id  # a same-process reconnect reuses it
                 self._persist_dm_topic_thread_id(int(chat_id), topic_name, thread_id)
                 # Seed message: Telegram's client hides empty topics until they contain one.
                 try:
@@ -2997,11 +2886,11 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                 logger.warning(
                     "[%s] Telegram fallback-IP discovery failed after %.0fs; "
                     "using seed IPv4 Telegram API IPs so a blackholed IPv6 hostname path cannot hang initialize() (#87015): %s",
-                    self.name, discovery_timeout, _redact_telegram_error_text(exc))
+                    self.name, discovery_timeout, _redact_telegram_error_text(exc, env_proxy_for_redaction()))
                 fallback_ips = list(SEED_FALLBACK_IPS)
             else:
                 logger.info("[%s] Auto-discovered Telegram fallback IPs: %s", self.name, ", ".join(fallback_ips))
-        proxy_url = resolve_proxy_url(
+        proxy_url = self._ptb_proxy_url = resolve_proxy_url(
             "TELEGRAM_PROXY", target_hosts=["api.telegram.org", *fallback_ips],
             configured=self.config.extra.get("proxy_url"))
 
@@ -3027,7 +2916,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                 {"transport": TelegramFallbackTransport(fallback_ips, **_transport_kwargs)},
                 {"transport": TelegramFallbackTransport(fallback_ips, **_updates_transport_kwargs)})
         elif proxy_url:
-            logger.info("[%s] Proxy detected; passing explicitly to HTTPXRequest: %s", self.name, proxy_url)
+            logger.info("[%s] Proxy detected; passing explicitly to HTTPXRequest: %s", self.name, safe_proxy_url_for_log(proxy_url))
             request, get_updates_request = _pair(_with_limits(), {"limits": _updates_limits}, proxy=proxy_url)
         else:
             if disable_fallback:
@@ -3158,10 +3047,10 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                 self._spawn_polling_recovery(loop, self._handle_polling_conflict(error))
             elif self._looks_like_network_error(error):
                 logger.warning(
-                    "[%s] Telegram network error, scheduling reconnect: %s", self.name, _redact_telegram_error_text(error))
+                    "[%s] Telegram network error, scheduling reconnect: %s", self.name, _redact_telegram_error_text(error, self._ptb_proxy_url))
                 self._spawn_polling_recovery(loop, self._handle_polling_network_error(error))
             else:
-                logger.error("[%s] Telegram polling error: %s", self.name, _redact_telegram_error_text(error), exc_info=True)
+                logger.error("[%s] Telegram polling error: %s", self.name, _redact_telegram_error_text(error, self._ptb_proxy_url), exc_info=describe_proxy_error(error, self._ptb_proxy_url) is None)
 
         self._polling_error_callback_ref = _polling_error_callback  # reused by _handle_polling_conflict
         drop_pending = self._cold_boot_drop_pending(is_reconnect=is_reconnect)
@@ -3256,7 +3145,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             return True
         except Exception as e:
             self._release_platform_lock()
-            safe_error = _redact_telegram_error_text(e)
+            safe_error = _redact_telegram_error_text(e, self._ptb_proxy_url or env_proxy_for_redaction("https://api.telegram.org"))
             # Classify by exception TYPE (never message text): auth failures can never self-heal, so
             # marking them retryable put agents into a silent eternal reconnect loop.
             if self._looks_like_auth_error(e):
@@ -3818,8 +3707,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         return result
 
     async def _edit_text(self, chat_id: str, message_id: str, text: str, parse_mode: Any = None) -> None:
-        """``editMessageText`` with normalized ids; ``parse_mode=None`` sends plain text."""
-        kwargs: dict[str, Any] = {"chat_id": normalize_telegram_chat_id(chat_id), "message_id": int(message_id), "text": text}
+        """``editMessageText`` (normalized ids, ``disable_link_previews`` honoured); ``parse_mode=None`` = plain."""
+        kwargs: dict[str, Any] = {"chat_id": normalize_telegram_chat_id(chat_id), "message_id": int(message_id), "text": text, **self._link_preview_kwargs()}
         if parse_mode is not None:
             kwargs["parse_mode"] = parse_mode
         await _await_with_thread_deadline(
@@ -4302,7 +4191,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                 rows = [[InlineKeyboardButton(str(idx + 1), callback_data=f"cl:{clarify_id}:{idx}")] for idx in range(len(choices))]
                 rows.append([InlineKeyboardButton(t("platform.telegram.prompt.other"), callback_data=f"cl:{clarify_id}:other")])
                 keyboard = InlineKeyboardMarkup(rows)
-            return text, keyboard, lambda msg: self._clarify_state.__setitem__(clarify_id, session_key)
+            return text, keyboard, lambda msg: self._clarify_state.__setitem__(clarify_id, ClarifyPrompt.from_sent(session_key, msg))
         return await self._send_prompt(
             "send_clarify", chat_id, metadata, build, parse_mode=ParseMode.HTML, thread_id=self._metadata_thread_id(metadata))
 
@@ -4372,16 +4261,16 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         """Handle choice picker button taps (cp:<index>)."""
         state = self._choice_picker_state.get(chat_id)
         if not state:
-            await query.answer(text=_toast("platform.telegram.picker.expired_rerun"))
+            await answer_or_note(self, query, _toast("platform.telegram.picker.expired_rerun"))
             return
         try:
             choice = state["choices"][int(data[3:])]
         except (ValueError, IndexError):
-            await query.answer(text=_toast("platform.telegram.picker.invalid_selection"))
+            await answer_callback(query, _toast("platform.telegram.picker.invalid_selection"))
             return
         callback = state.get("on_choice_selected")
         if not callback:
-            await query.answer(text=_toast("platform.telegram.picker.expired"))
+            await answer_or_note(self, query, _toast("platform.telegram.picker.expired"))
             return
         try:
             result_text = await callback(chat_id, str(choice.get("value") or ""))
@@ -4389,7 +4278,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             logger.error("Choice picker selection failed: %s", exc)
             result_text = t("platform.telegram.picker.apply_error", error=str(exc))
         await self._edit_result_text(query, result_text)
-        await query.answer()
+        await answer_callback(query)
         self._choice_picker_state.pop(chat_id, None)
 
     _MODEL_PAGE_SIZE = 8
@@ -4469,10 +4358,14 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             buttons.append(InlineKeyboardButton(short, callback_data=f"mm:{start + i}"))
         return self._paged_keyboard(buttons, page_meta, "mg", self._picker_back_cancel_row())
 
-    async def _picker_edit(self, query, text_md: str, keyboard) -> None:
-        """Re-render the picker message in place (MarkdownV2) and ack the tap."""
-        await query.edit_message_text(text=self.format_message(text_md), parse_mode=ParseMode.MARKDOWN_V2, reply_markup=keyboard)
-        await query.answer()
+    async def _picker_edit(self, query, text_md: str, keyboard, *, toast: Optional[str] = None) -> None:
+        """Ack first, then re-render in place (MarkdownV2): a refused edit must not leave the tap spinning."""
+        from telegram.error import TelegramError
+        await answer_callback(query, toast)
+        try:
+            await query.edit_message_text(text=self.format_message(text_md), parse_mode=ParseMode.MARKDOWN_V2, reply_markup=keyboard)
+        except TelegramError as exc:
+            logger.warning("[%s] model picker re-render failed: %s", self.name, _redact_telegram_error_text(exc))
 
     async def _picker_show_models(self, query, state: dict, page: int) -> None:
         """Render the model page for the provider currently selected in ``state``."""
@@ -4515,15 +4408,15 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         try:
             idx = int(raw_idx)
         except ValueError:
-            await query.answer(text=_toast("platform.telegram.picker.invalid_selection"))
+            await answer_callback(query, _toast("platform.telegram.picker.invalid_selection"))
             return None
         model_list = state.get("model_list", [])
         if idx < 0 or idx >= len(model_list):
-            await query.answer(text=_toast("platform.telegram.picker.invalid_model_index"))
+            await answer_callback(query, _toast("platform.telegram.picker.invalid_model_index"))
             return None
         callback = state.get("on_model_selected")
         if not callback:
-            await query.answer(text=_toast("platform.telegram.picker.expired"))
+            await answer_or_note(self, query, _toast("platform.telegram.picker.expired"))
             return None
         return idx, model_list[idx], state.get("selected_provider", ""), callback
 
@@ -4537,7 +4430,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             result_text = t("platform.telegram.picker.switch_error", error=str(exc))
             switch_failed = True
         await self._edit_result_text(query, result_text)
-        await query.answer(text=_toast("platform.telegram.picker.switch_failed" if switch_failed else "platform.telegram.picker.switched"))
+        await answer_callback(query, _toast("platform.telegram.picker.switch_failed" if switch_failed else "platform.telegram.picker.switched"))
         self._model_picker_state.pop(chat_id, None)
 
     @staticmethod
@@ -4545,21 +4438,21 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         try:
             return int(raw)
         except ValueError:
-            await query.answer(text=_toast("platform.telegram.picker.invalid_page"))
+            await answer_callback(query, _toast("platform.telegram.picker.invalid_page"))
             return None
 
     async def _handle_model_picker_callback(self, query, data: str, chat_id: str) -> None:
         """Handle model picker callbacks (mp:/mpg:/mpv:/mm:/mc:/mb/mx/mg:)."""
         state = self._model_picker_state.get(chat_id)
         if not state:
-            await query.answer(text=_toast("platform.telegram.picker.expired_model"))
+            await answer_or_note(self, query, _toast("platform.telegram.picker.expired_model"))
             return
         get_label = self._provider_get_label()
         if data.startswith("mp:"):  # provider selected: show model buttons (page 0)
             provider_slug = data[3:]
             provider = next((p for p in state["providers"] if p["slug"] == provider_slug), None)
             if not provider:
-                await query.answer(text=_toast("platform.telegram.picker.provider_not_found"))
+                await answer_callback(query, _toast("platform.telegram.picker.provider_not_found"))
                 return
             state["selected_provider"] = provider_slug
             state["selected_provider_name"] = provider.get("name", provider_slug)
@@ -4593,10 +4486,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             if warning is not None:
                 keyboard = InlineKeyboardMarkup([
                     [InlineKeyboardButton(t("platform.telegram.picker.switch_anyway"), callback_data=f"mc:{idx}")], self._picker_back_cancel_row()])
-                await query.edit_message_text(
-                    text=self.format_message(f"⚠ *{warning.title}*\n\n{warning.message}"),
-                    parse_mode=ParseMode.MARKDOWN_V2, reply_markup=keyboard)
-                await query.answer(text=_toast("platform.telegram.picker.confirm_selection"))
+                await self._picker_edit(query, f"⚠ *{warning.title}*\n\n{warning.message}", keyboard,
+                                        toast=_toast("platform.telegram.picker.confirm_selection"))
                 return
             await self._picker_switch(query, chat_id, model_id, provider_slug, callback)
         elif data.startswith("mpg:"):  # provider group selected: show member providers
@@ -4609,7 +4500,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             by_slug = {p["slug"]: p for p in state["providers"]}
             members = [by_slug[m] for m in member_slugs if m in by_slug]
             if not members:
-                await query.answer(text=_toast("platform.telegram.picker.group_not_found"))
+                await answer_callback(query, _toast("platform.telegram.picker.group_not_found"))
                 return
             rows = self._rows_of_two([self._provider_button(p) for p in members])
             rows.append(self._picker_back_cancel_row())
@@ -4623,16 +4514,16 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             await self._picker_show_providers(query, state, int(state.get("provider_page", 0) or 0), get_label)
         elif data == "mx":
             self._model_picker_state.pop(chat_id, None)
-            await query.edit_message_text(text=t("platform.telegram.picker.cancelled"), reply_markup=None)
-            await query.answer()
+            await answer_callback(query)
+            await self._edit_result_text(query, t("platform.telegram.picker.cancelled"))
         else:
-            await query.answer()  # e.g. page-counter button "mx:noop"
+            await answer_callback(query)  # e.g. page-counter button "mx:noop"
 
     async def _notify_clarify_expired(self, query, user_display: str) -> None:
         """Tell the user a clarify tap arrived too late (entry evicted or gateway restarted) — otherwise
         the tap leaves a misleading ✓ the agent never sees."""
         with contextlib.suppress(Exception):
-            await query.answer(text=_toast("platform.telegram.prompt.expired_toast"))
+            await answer_callback(query, _toast("platform.telegram.prompt.expired_toast"))
         await self._edit_html_quiet(
             query, f"❓ {_html.escape(query.message.text or '')}\n\n<i>{_html.escape(t('platform.telegram.prompt.expired_body'))}</i>")
 
@@ -4709,16 +4600,16 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             chat_type=str(cb["chat_type"]) if cb["chat_type"] is not None else None,
             thread_id=str(cb["thread_id"]) if cb["thread_id"] is not None else None, user_name=cb["user_name"]):
             return True
-        await query.answer(text=denial_text)
+        await answer_callback(query, denial_text)
         return False
 
     async def _handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Dispatch inline keyboard button clicks on the callback_data prefix."""
         query = update.callback_query
-        if not query or not query.data:
+        if not query:
             return
         self._accept_update()
-        data = query.data
+        data = query.data or ""
         cb = self._callback_ctx(query)
         # Model picker / generic choice picker (/reasoning, /fast) need a chat id.
         for prefixes, handler in (
@@ -4737,6 +4628,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             if data.startswith(prefix):
                 await handler(query, data, cb)
                 return
+        logger.debug("[%s] unhandled callback query (data=%r)", self.name, data[:64])
+        await answer_callback(query)  # no handler owns it (stale build, data-less game tap): ack anyway or it spins (#78788)
 
     async def _claim_callback_state(self, query, cb: dict[str, Any], state: dict, key, denial: str, resolved: str, *, pop: bool = True):
         """Auth-gate a button tap, then claim its pending entry; None (after answering) when refused or expired."""
@@ -4744,7 +4637,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             return None
         session_key = state.pop(key, None) if pop else state.get(key)
         if not session_key:
-            await query.answer(text=resolved)
+            await answer_callback(query, resolved)
         return session_key
 
     async def _handle_exec_approval_callback(self, query, data: str, cb: dict[str, Any]) -> None:
@@ -4756,7 +4649,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         try:
             approval_id = int(parts[2])
         except (ValueError, IndexError):
-            await query.answer(text=_toast("platform.telegram.approval.toast_invalid_data"))
+            await answer_callback(query, _toast("platform.telegram.approval.toast_invalid_data"))
             return
         session_key = await self._claim_callback_state(
             query, cb, self._approval_state, approval_id, _unauthorized(),
@@ -4784,7 +4677,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         else:
             label = t("platform.telegram.approval.expired")
             edit_text = t("platform.telegram.approval.expired_detail", label=label)
-        await query.answer(text=label[:_TOAST_LIMIT])
+        await answer_callback(query, label[:_TOAST_LIMIT])
         await edit_keeping_prompt(self, query, edit_text)
         # Typing was paused when the approval was sent; the text /approve and /deny paths resume it too.
         if count and cb["chat_id"] is not None:
@@ -4806,7 +4699,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             choice, "approval.resolved_generic")
         user_display = getattr(query.from_user, "first_name", None) or t("platform.telegram.user_fallback")
         label = t(f"platform.telegram.{label_key}")
-        await query.answer(text=label[:_TOAST_LIMIT])
+        await answer_callback(query, label[:_TOAST_LIMIT])
         decided = t("platform.telegram.approval.resolved_by_user", label=label, user=user_display)
         await edit_keeping_prompt(self, query, decided)
         # The runner stored a handler keyed by session_key; run it and send any returned text as a follow-up.
@@ -4843,17 +4736,15 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         parts = data.split(":", 2)
         if len(parts) != 3:
             return
-        clarify_id = parts[1]
-        choice_token = parts[2]
-        session_key = await self._claim_callback_state(
+        clarify_id, choice_token = parts[1], parts[2]
+        prompt = await self._claim_callback_state(
             query, cb, self._clarify_state, clarify_id, _unauthorized(),
             _toast("platform.telegram.slash_confirm.already_resolved"), pop=False)
-        if not session_key:
+        if not prompt or not await tap_matches_prompt(query, clarify_id, prompt, _toast("platform.telegram.prompt.invalid_choice")):
             return
         user_display = getattr(query.from_user, "first_name", None) or t("platform.telegram.user_fallback")
         if choice_token == "other":
-            # Flip to text-capture: the gateway's text-intercept resolves the clarify with the next message.
-            # Do NOT pop _clarify_state yet — still needed if the entry gets cleared by something else.
+            # Flip to text-capture (the next message resolves it); keep _clarify_state until then.
             flipped = False
             try:
                 from tools.clarify_gateway import mark_awaiting_text
@@ -4865,7 +4756,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                 self._clarify_state.pop(clarify_id, None)
                 await self._notify_clarify_expired(query, user_display)
                 return
-            await query.answer(text=_toast("platform.telegram.prompt.type_answer"))
+            await answer_callback(query, _toast("platform.telegram.prompt.type_answer"))
             await self._edit_html_quiet(
                 query,
                 f"❓ {query.message.text or ''}\n\n"
@@ -4875,7 +4766,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         try:
             idx = int(choice_token)
         except (ValueError, TypeError):
-            await query.answer(text=_toast("platform.telegram.prompt.invalid_choice"))
+            await answer_callback(query, _toast("platform.telegram.prompt.invalid_choice"))
             return
         resolved_text: Optional[str] = None
         try:
@@ -4896,10 +4787,10 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             logger.error("[%s] resolve_gateway_clarify failed: %s", self.name, exc)
             resolved = False
         if resolved:
-            await query.answer(text=f"✓ {resolved_text[:60]}")
+            await answer_callback(query, f"✓ {resolved_text[:60]}")
             await self._edit_html_quiet(
                 query, f"❓ {_html.escape(query.message.text or '')}\n\n<b>{_html.escape(user_display)}:</b> {_html.escape(resolved_text)}")
-            logger.info("Telegram clarify button resolved (id=%s, choice=%r, user=%s)", clarify_id, resolved_text, user_display)
+            log_resolved(query, clarify_id, prompt, resolved_text, user_display)
         else:
             # Entry evicted / gateway restarted between ask and tap.
             await self._notify_clarify_expired(query, user_display)
@@ -4910,7 +4801,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         answer = data.split(":", 1)[1]  # "y" or "n"
         if not await self._callback_authorized(query, cb, _unauthorized()):
             return
-        await query.answer(text=_toast("platform.telegram.prompt.update_sent", answer=answer))
+        await answer_callback(query, _toast("platform.telegram.prompt.update_sent", answer=answer))
         word = t("platform.telegram.prompt.affirm_word" if answer == "y" else "platform.telegram.prompt.negate_word")
         await self._edit_md_quiet(query, f"☤ {t('platform.telegram.prompt.update_answered', answer=f'*{word}*')}")
         try:
@@ -4943,20 +4834,20 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         """Dispatch a gmail-triage inline-button callback (gt:verb:arg)."""
         parts = data.split(":", 2)
         if len(parts) != 3:
-            await query.answer(text=_toast("platform.telegram.gmail_triage.invalid_data"))
+            await answer_callback(query, _toast("platform.telegram.gmail_triage.invalid_data"))
             return
         verb, arg = parts[1], parts[2]
         if not await self._callback_authorized(query, cb, _unauthorized()):
             return
         entry = self._GT_VERB_DISPATCH.get(verb)
         if not entry:
-            await query.answer(text=_toast("platform.telegram.gmail_triage.unknown_verb", verb=verb))
+            await answer_callback(query, _toast("platform.telegram.gmail_triage.unknown_verb", verb=verb))
             return
         script_name, extra_args, success_key, is_state_verb = entry
         from hermes_constants import get_hermes_home
         script_path = get_hermes_home() / "scripts" / "gmail-triage" / script_name
         if not script_path.exists():
-            await query.answer(text=_toast("platform.telegram.gmail_triage.script_missing", script=script_name))
+            await answer_callback(query, _toast("platform.telegram.gmail_triage.script_missing", script=script_name))
             logger.error("[%s] gmail-triage script missing: %s", self.name, script_path)
             return
         success = False
@@ -4983,7 +4874,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         except Exception as exc:
             label = t("platform.telegram.gmail_triage.error", verb=verb, error=str(exc))
             logger.error("[%s] gmail-triage callback exception: verb=%s arg=%s err=%s", self.name, verb, arg, exc, exc_info=True)
-        await query.answer(text=label[:_TOAST_LIMIT])
+        await answer_callback(query, label[:_TOAST_LIMIT])
         if not success:
             return
         original_text = (query.message.text or "") if query.message else ""
@@ -5167,9 +5058,10 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
     def _caption_1024(caption: Optional[str]) -> Optional[str]:
         return caption[:1024] if caption else None
 
-    async def _send_voice_bubble(self, audio_file, chat_id, reply_to, metadata, caption, duration_secs):
-        """sendVoice with caption variants: MarkdownV2 when it fits 1024 chars, plain fallback when the
-        Bot API rejects the entities; anything else is a real error."""
+    async def _send_voice_bubble(self, audio_file, chat_id, reply_to, metadata, caption, duration_secs,
+                                 send_fn=None, media_key="voice", **media_kwargs):
+        """sendVoice (or sendAudio via ``send_fn``/``media_key``) with caption variants: MarkdownV2 when it
+        fits 1024 chars, plain fallback when the Bot API rejects the entities; anything else is a real error."""
         # Render caption markdown (#32029): auto-TTS captions carry the agent's markdown reply, which showed
         # literal *asterisks* and [links](...) without a parse_mode. Format to MarkdownV2 when it fits the
         # 1024-char caption cap; fall back to the raw text (previous behaviour) when formatting would
@@ -5189,8 +5081,9 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         for _cap_text, _cap_parse_mode in _caption_variants:
             try:
                 return await self._send_media(
-                    self._bot.send_voice, chat_id, reply_to, metadata, "voice", reset_media=lambda: audio_file.seek(0),
-                    voice=audio_file, caption=_cap_text, parse_mode=_cap_parse_mode, duration=duration_secs)
+                    send_fn or self._bot.send_voice, chat_id, reply_to, metadata, media_key,
+                    reset_media=lambda: audio_file.seek(0), **{media_key: audio_file}, caption=_cap_text,
+                    parse_mode=_cap_parse_mode, duration=duration_secs, **media_kwargs)
             except Exception as _cap_error:
                 err = str(_cap_error).lower()
                 if _cap_parse_mode is not None and ("parse" in err or "entit" in err):
@@ -5230,9 +5123,18 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                 if ext in {".ogg", ".opus"}:  # round playable voice bubble
                     msg = await self._send_voice_bubble(audio_file, chat_id, reply_to, metadata, caption, _duration_secs)
                 elif ext in {".mp3", ".m4a"}:  # Bot API sendAudio only accepts MP3 / M4A
-                    msg = await self._send_media(
-                        self._bot.send_audio, chat_id, reply_to, metadata, "audio", reset_media=lambda: audio_file.seek(0),
-                        audio=audio_file, caption=self._caption_1024(caption), duration=_duration_secs)
+                    player = await asyncio.to_thread(audio_player_fields, audio_path)
+                    cover_path = player.pop("thumbnail_path", None)
+                    if cover_path:  # a path, not a handle: PTB reads it per attempt, so retries keep the cover
+                        player["thumbnail"] = cover_path
+                    try:
+                        msg = await self._send_voice_bubble(
+                            audio_file, chat_id, reply_to, metadata, caption, _duration_secs,
+                            send_fn=self._bot.send_audio, media_key="audio", **player)
+                    finally:
+                        if cover_path:
+                            with contextlib.suppress(OSError):
+                                os.unlink(cover_path)
                 else:  # formats Telegram can't play natively (.wav, .flac, ...)
                     return await self.send_document(
                         chat_id=chat_id, file_path=audio_path, caption=caption, reply_to=reply_to, metadata=metadata)
@@ -5982,9 +5884,13 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
     _BOT_IDENTITY_PROBE_TIMEOUT = 15.0
 
     def _is_reply_to_bot(self, message: Message) -> bool:
-        if not self._bot or not getattr(message, "reply_to_message", None):
+        replied, thread_id = getattr(message, "reply_to_message", None), getattr(message, "message_thread_id", None)
+        # Every plain post in a forum topic "replies" to the topic's creation message (id == thread id);
+        # a bot-created topic's anchor is not a reply to the bot (#118678).
+        if not self._bot or not replied or (getattr(replied, "forum_topic_created", None) is not None
+                                            and thread_id is not None and getattr(replied, "message_id", None) == thread_id):
             return False
-        reply_user = getattr(message.reply_to_message, "from_user", None)
+        reply_user = getattr(replied, "from_user", None)
         return bool(reply_user and getattr(reply_user, "id", None) == getattr(self._bot, "id", None))
 
     @staticmethod
@@ -6116,20 +6022,21 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             tracked.add(task)
             task.add_done_callback(tracked.discard)
 
-    def _explicit_bot_mentions_exclude_self(self, message: Message) -> bool:
-        """True when explicit bot handles target other bots, not this one (``@bot3 hi @bot4`` must not
-        wake ``@bot1`` via reply/wake-word fallbacks)."""
-        if not self._bot:
-            return False
-        bot_username = self._current_bot_username()
+    def _explicit_bot_mentions_exclude_self(self, message: Message, *, log_skip: bool = True) -> bool:
+        """True when the message is addressed (leading handles) to other bots and names us nowhere; a
+        foreign handle later in the text only talks about that bot (#136236)."""
+        bot_username = self._current_bot_username() if self._bot else None
         if not bot_username:
             return False
-        mentioned_bot_usernames = self._extract_bot_mention_usernames(message, bot_username)
-        excludes_self = bool(mentioned_bot_usernames) and bot_username not in mentioned_bot_usernames
-        if excludes_self:
-            # Either truly for another bot, or our handle is stale after a rename — re-check out of band.
-            self._schedule_bot_identity_recheck()
-        return excludes_self
+        from plugins.platforms.telegram.telegram_addressing import foreign_command_target, leading_bot_handles
+        target = foreign_command_target(message, bot_username)
+        addressed = {target} if target else leading_bot_handles(message, lambda h: h == bot_username or bool(self._FOREIGN_BOT_HANDLE_RE.fullmatch(h)))
+        if not addressed or (not target and bot_username in self._extract_bot_mention_usernames(message, bot_username)):
+            return False
+        self._schedule_bot_identity_recheck()  # or our handle is stale after a rename: re-check out of band
+        if log_skip:  # the observe gate re-asks; one line per skip
+            logger.info("[%s] Skipping message %s in chat %s: addressed to other bot(s) %s", self.name, getattr(message, "message_id", None), self._chat_id_str(message), ", ".join(f"@{h}" for h in sorted(addressed)))
+        return True
 
     def _message_matches_mention_patterns(self, message: Message) -> bool:
         if not self._mention_patterns:
@@ -6144,11 +6051,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         return self._telegram_guest_mode() and self._message_mentions_bot(message)
 
     def _clean_bot_trigger_text(self, text: Optional[str]) -> Optional[str]:
-        bot_username = self._current_bot_username()
-        if not text or not bot_username:
-            return text
-        cleaned = re.sub(rf"(?i)@{re.escape(bot_username)}\b[,:\-]*\s*", "", text).strip()
-        return cleaned or text
+        from plugins.platforms.telegram.telegram_addressing import clean_bot_trigger_text
+        return clean_bot_trigger_text(text, self._current_bot_username())
 
     def _topic_gates_pass(self, thread_id, *, warn_non_numeric: bool) -> Optional[bool]:
         """``allowed_topics`` / ``ignored_threads`` gates; False = blocked, None = undecided."""
@@ -6182,21 +6086,19 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         if self._topic_gates_pass(getattr(message, "message_thread_id", None), warn_non_numeric=False) is False:
             return False
         chat_id_str = self._chat_id_str(message)
-        if self._telegram_exclusive_bot_mentions() and self._explicit_bot_mentions_exclude_self(message):
+        if self._telegram_exclusive_bot_mentions() and self._explicit_bot_mentions_exclude_self(message, log_skip=False):
             return False
         # Observed context is shared at chat/topic scope, so require an explicit chat allowlist.
         allowed = self._telegram_observe_allowed_chats()
         if not allowed or chat_id_str not in allowed:
             return False
-        # Free-response chats/topics dispatch every message, so they are never observed.
-        if chat_id_str in self._telegram_free_response_chats() or self._telegram_is_free_response_topic(message):
-            return False
-        # Only observe messages the require_mention gate would skip. The bot-to-bot loop breaker
-        # in ``_should_process_message`` skips another bot's message too, so a sibling bot
-        # addressing us by wake word (or quote-reply) is never dispatched and must still be
-        # kept as observed context (#115119).
+        # Only observe what is NOT dispatched: the bot-to-bot loop breaker skips a sibling bot's wake word or
+        # quote-reply, which must stay observed context (#115119), in free-response chats/topics too (#147623).
         if self._bot_sender_suppressed(message):
             return True
+        # Free-response chats/topics dispatch every other message, so they are never observed.
+        if chat_id_str in self._telegram_free_response_chats() or self._telegram_is_free_response_topic(message):
+            return False
         if not self._telegram_require_mention() or self._is_reply_to_bot(message) or self._message_mentions_bot(message):
             return False
         return not self._message_matches_mention_patterns(message)
@@ -6375,7 +6277,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             session_entry = store.get_or_create_session(self._telegram_group_observe_shared_source(event.source))
             entry = {
                 "role": "user", "content": self._telegram_group_observe_attributed_text(event),
-                "timestamp": datetime.now(tz=UTC).isoformat(), "observed": True}
+                "timestamp": time.time(), "observed": True}
             if event.message_id:
                 entry["message_id"] = str(event.message_id)
             self._accept_update()
@@ -6433,14 +6335,14 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         guest_mention = self._is_guest_mention(message)
         # allowed_chats whitelist: outside chats pass only via the guest-mode explicit mention.
         allowed = self._telegram_allowed_chats()
-        if allowed and chat_id_str not in allowed:
+        if (allowed and chat_id_str not in allowed) or guest_mention:
             return guest_mention
-        if guest_mention or chat_id_str in self._telegram_free_response_chats() or self._telegram_is_free_response_topic(message):
-            return True
-        # Bot-to-bot loop breaker: another bot must explicitly @mention us; its quote-reply or
-        # plain chatter does not count (two bots answering each other's replies never stop otherwise).
+        # Bot-to-bot loop breaker: another bot must explicitly @mention us (quote-replies and chatter don't
+        # count). Before the free-response exemption, which is for humans only (#147623).
         if self._bot_sender_suppressed(message):
             return False
+        if chat_id_str in self._telegram_free_response_chats() or self._telegram_is_free_response_topic(message):
+            return True
         if not self._telegram_require_mention() or self._is_reply_to_bot(message):
             return True
         if not self._telegram_guest_mode() and self._message_mentions_bot(message):
@@ -6469,9 +6371,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             except Exception as e:
                 logger.warning("[%s] Forum command lazy-registration failed: %s", self.name, _redact_telegram_error_text(e))
 
-    def _effective_update_message(self, update: Update) -> Optional[Message]:
-        """Message-like payload for normal messages and channel posts (``update.channel_post``)."""
-        return getattr(update, "effective_message", None) or getattr(update, "message", None)
+    _effective_update_message = staticmethod(effective_update_message)
 
     def _log_blocked_user(self, msg, *, level=logging.WARNING, what: str = "unauthorized user") -> None:
         logger.log(
@@ -6562,11 +6462,6 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         await self.handle_message(self._apply_telegram_group_observe_attribution(event))
 
     # -- Text message aggregation (handles Telegram client-side splits) --
-
-    def _text_batch_key(self, event: MessageEvent) -> str:
-        """Session-scoped batching key; topic recovery first so DM-topic batches coalesce on the recovered lane."""
-        self._apply_topic_recovery(event)
-        return super()._text_batch_key(event)
 
     def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text chunk, or hold it while delayed delivery must be dropped."""
@@ -6820,7 +6715,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
 
     async def _handle_media_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming media messages, downloading images to local cache."""
-        msg = update.message
+        msg = self._effective_update_message(update)  # channel posts arrive as update.channel_post
         if not msg:
             return
         if not self._is_user_authorized_from_message(msg):
@@ -6931,8 +6826,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
     def _reload_dm_topics_from_config(self) -> None:
         """Re-read dm_topics from config.yaml so externally created topics work without restart."""
         try:
-            from hermes_cli.config import load_config_readonly  # canonical loader: managed overlay + ${VAR}
-            dm_topics = load_config_readonly().get("platforms", {}).get("telegram", {}).get("extra", {}).get("dm_topics", [])
+            from hermes_cli.config import load_config  # deep-copied: _setup_dm_topics writes thread_ids into it
+            dm_topics = load_config().get("platforms", {}).get("telegram", {}).get("extra", {}).get("dm_topics", [])
             if not dm_topics:
                 self._dm_topics_config = []
                 self._dm_topic_chat_ids = set()
