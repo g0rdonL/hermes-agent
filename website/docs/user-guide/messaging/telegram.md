@@ -144,6 +144,21 @@ platforms:
       max_concurrent_updates: 32   # 1 restores fully sequential processing
 ```
 
+### Albums (Optional)
+
+Telegram delivers an album (several photos or files sent together) as one update per item.
+Hermes waits until every item that has arrived is downloaded, then sends the whole album to the
+agent as one message. It waits at most 8 seconds for a slow download before sending what it has.
+After the last item, it waits a short debounce (default 1.5 s, at most 10 s) for one sent later.
+Raise the debounce if your phone uploads album items far apart:
+
+```yaml
+platforms:
+  telegram:
+    extra:
+      media_group_wait_seconds: 3.0
+```
+
 ### Repeated inbound updates
 
 Hermes suppresses repeated Telegram `update_id` values before message batching,
@@ -261,7 +276,7 @@ telegram:
   observe_unmentioned_group_messages: true
 ```
 
-With this mode enabled, unmentioned group messages from explicitly allowlisted chats/topics are appended to the shared chat/topic session transcript as observed context, but they do not dispatch the agent. `allowed_chats` gates where the bot responds; `group_allowed_chats` authorizes the shared group session used for observed context, so use the same chat IDs for this mode. A later `@botname` mention, reply to the bot, or configured mention pattern in that same allowlisted chat/topic can use that observed context. The triggered message is also tagged with `[nickname|user_id]` and gets a per-turn safety prompt so the model treats prior observed lines as context, not instructions addressed to the bot.
+With this mode enabled, unmentioned group messages from explicitly allowlisted chats/topics are appended to the shared chat/topic session transcript as observed context, but they do not dispatch the agent. `allowed_chats` gates where the bot responds; `group_allowed_chats` authorizes the shared group session used for observed context, so use the same chat IDs for this mode. A later `@botname` mention, reply to the bot, or configured mention pattern in that same allowlisted chat/topic can use that observed context. The triggered message is also tagged with `[nickname|user_id]` and gets a per-turn safety prompt so the model treats prior observed lines as context, not instructions addressed to the bot. Slash commands sent in that chat/topic (`/new`, `/model`, `/undo`, skill commands) act on the same shared session, while admin-only commands are still checked against the sender.
 
 Equivalent environment variable:
 
@@ -606,6 +621,7 @@ When `base_url` is set, Hermes:
 - Builds the python-telegram-bot client against the local server
 - Auto-lifts its internal document/audio size cap from 20 MB → 2 GB
 - Reports the active limit in the "too large" error message (`Maximum: 2048 MB.`) so it's obvious which mode you're in
+- Sends through the same server outside the gateway too: `hermes send`, the `send_message` tool and cron deliveries that fall back to the standalone sender
 
 Restart the gateway and look for a confirmation log line:
 
@@ -1016,6 +1032,7 @@ Shows the current topic's binding: session title, session ID, and hints for `/ne
 - BotFather setup screenshots are rate-limited to one send per 5 minutes per **(profile, chat)** — repeated `/topic` attempts while Threads Settings are still disabled won't re-upload the same image
 - `/bg <prompt>` started inside a topic delivers its result back to the same topic; background sessions don't trigger auto-rename of the owning topic
 - `/topic` itself is gated by the bot's user authorization check — unauthorized DMs get a refusal instead of activation
+- When Telegram rejects a topic with `message thread not found` (the topic was deleted, or topics were turned off in the Telegram client), Hermes retries the same topic once by `direct_messages_topic_id`, then delivers the reply to the root chat without its reply anchor and drops that topic's binding. A reply whose anchor message was deleted keeps its topic and only loses the anchor. A send to a topic Hermes just created by name fails instead, so the topic is recreated rather than the reply landing in the root. Removing the chat's last binding turns topic mode off, so the root DM works as a normal chat again
 
 ### Disabling multi-session mode
 
@@ -1159,6 +1176,8 @@ gateway:
 
 This setting is for client-rendering/copy compatibility; Hermes already falls back automatically when Telegram rejects the rich API call. `rich_drafts` controls whether the DM streaming preview *renders* rich (`sendRichMessageDraft`) and stays off by default because Telegram Desktop/macOS can visually overlay rich draft frames until the chat redraws; with it off, the preview streams plain and the final still arrives as a native Rich Message.
 
+The same setting applies to sends made outside the gateway process: `hermes send`, the `send_message` tool, and cron deliveries that fall back to the standalone sender take the rich path under the same rules. They also escape the `(1/2)` chunk marker on long messages, and treat only Telegram's own HTML tags (`<b>`, `<a>`, `<code>`, ...) as HTML. A `<details>` block or an angle-bracket placeholder therefore keeps its Markdown formatting. A message the Bot API still rejects as HTML is retried as MarkdownV2 before falling back to plain text. Two or more photos sent together arrive as a native album (`sendMediaGroup`, 10 per album).
+
 CJK text (Chinese, Japanese, Korean, and rare Han extensions) stays on the legacy MarkdownV2 path by default because affected Telegram Desktop/macOS clients have rendered Bot API rich messages with overlapping CJK glyph artifacts. If you use an unaffected client and prefer native rich tables/task lists/details/math for CJK payloads, set `allow_cjk_rich_messages: true` alongside `rich_messages: true` to opt in to that client-side risk.
 
 If you only want the legacy "always code-block" table behavior while keeping rich messages enabled, disable table normalization by setting `telegram.pretty_tables: false` in `config.yaml` (default: `true`).
@@ -1175,7 +1194,7 @@ gateway:
 
 When enabled, Hermes attaches Telegram's `LinkPreviewOptions(is_disabled=True)` to every outgoing message, including the streaming preview edits and the final edit of a streamed reply (edits that resolve a button prompt, such as an approval card, don't carry it yet), and falls back to the legacy `disable_web_page_preview` parameter on older `python-telegram-bot` versions.
 
-**Long replies and flood control.** A reply longer than Telegram's 4,096-character limit is sent as numbered parts (`(1/3)`, `(2/3)`, …). Sends to one chat are delivered one reply at a time, so a scheduled report and a DM answer landing together cannot interleave their parts, and a file upload cannot land between two parts of the text it accompanies. If Telegram's flood control refuses a part mid-way, Hermes resumes from the refused part once the penalty passes instead of re-sending the parts already on screen, and while a chat is inside a known penalty window further sends to it fail closed locally (no extra requests that would lengthen the penalty). A penalty longer than the gateway's inline wait cap is handed to the delivery ledger, which redelivers the reply with a "part of it may already have arrived above" note.
+**Long replies and flood control.** A reply longer than Telegram's 4,096-character limit is sent as numbered parts (`(1/3)`, `(2/3)`, …). Sends to one chat are delivered one reply at a time, so a scheduled report and a DM answer landing together cannot interleave their parts, and a file upload cannot land between two parts of the text it accompanies. If Telegram's flood control refuses a part mid-way, Hermes resumes from the refused part once the penalty passes instead of re-sending the parts already on screen, and while a chat is inside a known penalty window further sends to it fail closed locally (no extra requests that would lengthen the penalty). A penalty longer than the gateway's inline wait cap is handed to the delivery ledger, which redelivers the reply with a "part of it may already have arrived above" note. File attachments (documents, photos, videos, voice) follow the same rule: a short penalty is waited out and the upload retried; a longer one schedules a single native re-upload once the window has passed, and you only see the "Couldn't deliver the file attachment" notice if that re-upload is refused too.
 
 ## Group Allowlisting
 
@@ -1324,6 +1343,8 @@ In some restricted networks, `api.telegram.org` may resolve to an IP that is unr
 3. Known IPv4 Telegram API IPs are tried **before** the dual-stack `api.telegram.org` hostname. A blackholed IPv6 path can sit in `connect()` without erroring, which used to pin the event loop so the 30s init deadline never fired.
 4. If DoH is also blocked or times out, a hardcoded IPv4 seed list (`149.154.166.110`, `149.154.167.220`) is used as that IPv4-first list. The hostname remains last resort.
 5. Once a path succeeds, it becomes "sticky" — subsequent requests use it directly. The hostname is kept as a last resort for IPv6-only networks.
+
+Sends made outside the gateway process (`hermes send`, the `send_message` tool, standalone cron delivery) use the same transport with your configured IPs or the seed list. They skip DoH discovery so a one-shot send stays fast. They also use the gateway's `HERMES_TELEGRAM_HTTP_*` timeouts and its 60s media-upload write timeout. A connect or pool timeout is retried there, because the request never left. Any other timeout is not retried: Telegram may already have delivered the message.
 
 ### Configuration
 
@@ -1492,6 +1513,8 @@ HERMES_TELEGRAM_NOTIFICATIONS=all
 ```
 
 Unknown values log a warning and fall back to `important`.
+
+`hermes send`, the `send_message` tool and standalone cron delivery follow the same mode. Under `important` their messages arrive silently, except cron briefs, which ring by default (`cron.delivery.notify`, as in the gateway lane).
 
 ## Status messages edited in place
 
